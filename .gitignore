@@ -1,0 +1,3 @@
+*.bsp
+__pycache__/
+*.pyc
