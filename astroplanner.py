@@ -641,6 +641,746 @@ def print_iss_transits(results, start_date, days, tz_offset):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Weather + email alert
+# ──────────────────────────────────────────────────────────────────────
+
+def fetch_night_weather(dark_start_utc, dark_end_utc):
+    """
+    Fetch hourly cloud cover and precipitation forecast from NWS API
+    for the overnight dark window. Returns dict with weather summary
+    or None on failure. (Free, no API key, US locations only.)
+    """
+    import json
+    import urllib.request
+
+    headers = {"User-Agent": "(astroplanner, astro@example.com)"}
+
+    # Step 1: resolve grid endpoint for our location
+    try:
+        req = urllib.request.Request(
+            f"https://api.weather.gov/points/{LATITUDE},{LONGITUDE}",
+            headers=headers,
+        )
+        resp = urllib.request.urlopen(req, timeout=10)
+        points = json.loads(resp.read().decode())
+        hourly_url = points["properties"]["forecastHourly"]
+    except Exception as e:
+        print(f"  Weather: could not resolve NWS grid — {e}")
+        return None
+
+    # Step 2: fetch hourly forecast
+    try:
+        req = urllib.request.Request(hourly_url, headers=headers)
+        resp = urllib.request.urlopen(req, timeout=10)
+        forecast = json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"  Weather: could not fetch forecast — {e}")
+        return None
+
+    # Step 3: extract overnight hours that overlap the dark window
+    dark_start_dt = dark_start_utc.to_datetime(timezone=timezone.utc)
+    dark_end_dt = dark_end_utc.to_datetime(timezone=timezone.utc)
+
+    night_periods = []
+    for period in forecast["properties"]["periods"]:
+        # NWS gives ISO timestamps like "2026-03-25T20:00:00-07:00"
+        start = datetime.fromisoformat(period["startTime"])
+        end = datetime.fromisoformat(period["endTime"])
+        start_utc = start.astimezone(timezone.utc)
+        end_utc = end.astimezone(timezone.utc)
+
+        # Keep periods that overlap the dark window
+        if end_utc <= dark_start_dt or start_utc >= dark_end_dt:
+            continue
+
+        # Extract cloud cover from the detailed forecast text
+        short = period.get("shortForecast", "").lower()
+        cloud_pct = _parse_cloud_cover(short)
+        precip_pct = period.get("probabilityOfPrecipitation", {}).get("value") or 0
+        humidity = period.get("relativeHumidity", {}).get("value") or 0
+        wind_speed = period.get("windSpeed", "")
+
+        night_periods.append({
+            "start": start_utc,
+            "cloud_pct": cloud_pct,
+            "precip_pct": precip_pct,
+            "humidity": humidity,
+            "wind_speed": wind_speed,
+            "short_forecast": period.get("shortForecast", ""),
+        })
+
+    if not night_periods:
+        return None
+
+    avg_cloud = sum(p["cloud_pct"] for p in night_periods) / len(night_periods)
+    max_precip = max(p["precip_pct"] for p in night_periods)
+    avg_humidity = sum(p["humidity"] for p in night_periods) / len(night_periods)
+
+    # Worst-case forecast text for the night
+    forecasts = list(dict.fromkeys(p["short_forecast"] for p in night_periods))
+
+    return {
+        "avg_cloud_pct": avg_cloud,
+        "max_precip_pct": max_precip,
+        "avg_humidity": avg_humidity,
+        "forecasts": forecasts,
+        "n_hours": len(night_periods),
+    }
+
+
+def _parse_cloud_cover(short_forecast):
+    """Estimate cloud cover percentage from NWS short forecast text."""
+    s = short_forecast.lower()
+    if "clear" in s or "sunny" in s:
+        return 5
+    if "mostly clear" in s or "mostly sunny" in s:
+        return 15
+    if "partly" in s:
+        return 45
+    if "mostly cloudy" in s:
+        return 75
+    if "cloudy" in s or "overcast" in s:
+        return 90
+    if "fog" in s:
+        return 85
+    return 50  # unknown
+
+
+def evaluate_night(weather, moon_illum, n_excellent, n_good):
+    """
+    Rate the overall night quality. Returns (grade, reason) where
+    grade is 'excellent', 'good', 'fair', 'poor', or 'skip'.
+    """
+    reasons = []
+
+    # Weather score
+    if weather is None:
+        weather_score = 0.5
+        reasons.append("weather unknown")
+    else:
+        cloud = weather["avg_cloud_pct"]
+        if cloud <= 15:
+            weather_score = 1.0
+            reasons.append("clear skies")
+        elif cloud <= 35:
+            weather_score = 0.7
+            reasons.append("mostly clear")
+        elif cloud <= 55:
+            weather_score = 0.4
+            reasons.append("partly cloudy")
+        else:
+            weather_score = 0.1
+            reasons.append(f"cloudy ({cloud:.0f}% cover)")
+
+        if weather["max_precip_pct"] > 30:
+            weather_score *= 0.3
+            reasons.append(f"{weather['max_precip_pct']}% chance of rain")
+
+    # Moon score — bright moon is a hard penalty for DSO imaging
+    if moon_illum < 10:
+        moon_score = 1.0
+        reasons.append(f"new moon ({moon_illum:.0f}%)")
+    elif moon_illum < 25:
+        moon_score = 0.85
+        reasons.append(f"thin crescent ({moon_illum:.0f}%)")
+    elif moon_illum < 50:
+        moon_score = 0.55
+        reasons.append(f"crescent ({moon_illum:.0f}%)")
+    elif moon_illum < 75:
+        moon_score = 0.25
+        reasons.append(f"half moon ({moon_illum:.0f}%)")
+    else:
+        moon_score = 0.05
+        reasons.append(f"bright moon ({moon_illum:.0f}%)")
+
+    # Targets score
+    if n_excellent >= 5:
+        target_score = 1.0
+    elif n_excellent >= 2 or n_good >= 5:
+        target_score = 0.7
+    elif n_good >= 2:
+        target_score = 0.4
+    else:
+        target_score = 0.2
+
+    # Weighted combination — moon is the strongest factor for DSO imaging
+    overall = weather_score * 0.35 + moon_score * 0.40 + target_score * 0.25
+
+    # Hard caps: bright moon or bad weather can never be "excellent"
+    if moon_illum >= 60:
+        cap = "fair"
+    elif moon_illum >= 40:
+        cap = "good"
+    else:
+        cap = "excellent"
+
+    if weather is not None and weather["avg_cloud_pct"] >= 60:
+        cap = min(cap, "fair", key=["poor", "fair", "good", "excellent"].index)
+    if weather is not None and weather["max_precip_pct"] >= 50:
+        cap = "poor"
+
+    if overall >= 0.75:
+        grade = "excellent"
+    elif overall >= 0.50:
+        grade = "good"
+    elif overall >= 0.30:
+        grade = "fair"
+    else:
+        grade = "poor"
+
+    # Apply cap
+    grades_ranked = ["poor", "fair", "good", "excellent"]
+    if grades_ranked.index(grade) > grades_ranked.index(cap):
+        grade = cap
+
+    return grade, reasons
+
+
+def compose_alert_report(night_date, grade, reasons, weather, moon_illum,
+                         moon_status, dark_start, dark_end, dark_hours,
+                         results, min_alt, tz_offset, iss_events=None):
+    """Build the alert report as a plain-text string."""
+    iss_events = iss_events or []
+    has_transit = any(e["is_transit"] for e in iss_events)
+
+    lines = []
+    title = f"SEESTAR S50 — Tonight's Imaging: {grade.upper()}"
+    if has_transit:
+        title += " + ISS LUNAR TRANSIT"
+    lines.append(title)
+    lines.append(f"{'=' * 60}")
+    lines.append(f"Date: {night_date.strftime('%A, %B %d, %Y')}")
+    lines.append(f"Location: Sunnyvale, CA")
+    lines.append(f"Conditions: {', '.join(reasons)}")
+    lines.append("")
+
+    # Weather
+    lines.append(f"WEATHER")
+    lines.append(f"-" * 40)
+    if weather:
+        lines.append(f"Cloud cover (avg): {weather['avg_cloud_pct']:.0f}%")
+        lines.append(f"Precipitation:     {weather['max_precip_pct']}% chance")
+        lines.append(f"Humidity (avg):    {weather['avg_humidity']:.0f}%")
+        lines.append(f"Forecast: {' → '.join(weather['forecasts'])}")
+    else:
+        lines.append("Could not fetch weather data.")
+    lines.append("")
+
+    # Darkness & Moon
+    lines.append(f"DARKNESS & MOON")
+    lines.append(f"-" * 40)
+    lines.append(f"Dark window: {utc_to_local(dark_start, tz_offset)}-"
+                 f"{utc_to_local(dark_end, tz_offset)} {TIMEZONE_NAME} "
+                 f"({dark_hours:.1f}h)")
+    lines.append(f"Moon: {moon_illum:.0f}% illuminated, {moon_status}")
+    lines.append("")
+
+    # ISS transit section (before targets — this is the urgent info)
+    if iss_events:
+        tz = timezone(timedelta(hours=tz_offset))
+        lines.append(f"ISS LUNAR TRANSIT")
+        lines.append(f"-" * 40)
+        for ev in iss_events:
+            dt = ev["time"].utc_datetime().replace(tzinfo=timezone.utc).astimezone(tz)
+            if ev["is_transit"]:
+                lines.append(f">>> TRANSIT at {dt.strftime('%H:%M:%S')} {TIMEZONE_NAME}")
+                lines.append(f"    Duration:  {ev['transit_duration_s']:.2f}s")
+                lines.append(f"    Closest:   {ev['min_sep']:.3f}° from center "
+                             f"(moon radius: {ev['moon_ang_radius']:.3f}°)")
+                lines.append(f"    Moon:      {ev['moon_alt']:.1f}° alt, "
+                             f"{ev['moon_illum']:.0f}% illuminated")
+                lines.append(f"    ISS alt:   {ev['iss_alt']:.1f}°")
+                if moon_illum >= 50:
+                    lines.append(f"    Bright moon is ideal for capturing ISS silhouette!")
+            else:
+                lines.append(f"Near miss at {dt.strftime('%H:%M:%S')} {TIMEZONE_NAME}"
+                             f"  ({ev['min_sep']:.2f}° from center)")
+        lines.append(f"Use video mode or high-speed camera — transit lasts < 2 seconds.")
+        lines.append("")
+
+    # Top targets
+    lines.append(f"TOP TARGETS")
+    lines.append(f"-" * 40)
+    top = results[:10]
+    lines.append(f"{'Object':<28} {'Score':>5} {'Peak':>6} "
+                 f"{'Window':<13} {'Hrs':>4}")
+    for r in top:
+        display = f"{r['name']} {r['common']}"
+        if len(display) > 27:
+            display = display[:27]
+        window = (f"{utc_to_local(r['window_start'], tz_offset)}-"
+                  f"{utc_to_local(r['window_end'], tz_offset)}")
+        label = score_label(r["score"]).strip()
+        lines.append(f"{display:<28} {r['score']:>5.0f} {r['peak_alt']:>5.1f}° "
+                     f"{window:<13} {r['hours_above']:>3.1f}  {label}")
+    lines.append("")
+
+    # Detailed notes for top 3
+    lines.append(f"IMAGING PLAN")
+    lines.append(f"-" * 40)
+    for r in top[:3]:
+        if r["score"] < 40:
+            break
+        lines.append(f"{r['name']} ({r['common']}) — {r['type']}, "
+                     f"mag {r['mag']}, {r['size']}' diameter")
+        lines.append(f"  Peak: {r['peak_alt']:.1f}° at "
+                     f"{utc_to_local(r['peak_time'], tz_offset)} {TIMEZONE_NAME}")
+        lines.append(f"  Window: {utc_to_local(r['window_start'], tz_offset)}-"
+                     f"{utc_to_local(r['window_end'], tz_offset)} "
+                     f"({r['hours_above']:.1f}h above {min_alt}°)")
+        lines.append(f"  Moon: {r['moon_illum']:.0f}% illum, "
+                     f"{r['moon_sep']:.1f}° away"
+                     f"{', below horizon' if r['moon_alt'] < 0 else ''}")
+        if r["notes"]:
+            lines.append(f"  Tip: {r['notes']}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def send_email(subject, body):
+    """
+    Send email via SMTP. Reads config from environment variables:
+      ASTRO_EMAIL_TO    — recipient address (required)
+      ASTRO_EMAIL_FROM  — sender address (required)
+      ASTRO_EMAIL_PASS  — sender password / app password (required)
+      ASTRO_SMTP_HOST   — SMTP server (default: smtp.gmail.com)
+      ASTRO_SMTP_PORT   — SMTP port (default: 587)
+    Returns True on success, False on failure.
+    """
+    import os
+    import smtplib
+    from email.mime.text import MIMEText
+
+    to_addr = os.environ.get("ASTRO_EMAIL_TO")
+    from_addr = os.environ.get("ASTRO_EMAIL_FROM")
+    password = os.environ.get("ASTRO_EMAIL_PASS")
+
+    if not all([to_addr, from_addr, password]):
+        return False
+
+    host = os.environ.get("ASTRO_SMTP_HOST", "smtp.gmail.com")
+    port = int(os.environ.get("ASTRO_SMTP_PORT", "587"))
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = to_addr
+
+    try:
+        with smtplib.SMTP(host, port, timeout=15) as server:
+            server.starttls()
+            server.login(from_addr, password)
+            server.sendmail(from_addr, [to_addr], msg.as_string())
+        return True
+    except Exception as e:
+        print(f"  Email send failed: {e}", file=sys.stderr)
+        return False
+
+
+def run_alert(location, start_date, min_alt, min_moon_sep, min_grade="fair"):
+    """
+    Evaluate tonight and send an email alert if conditions meet min_grade.
+    If email is not configured, prints the report to stdout instead.
+
+    Designed to be run from cron, e.g.:
+      0 16 * * * python3 /path/to/astroplanner.py --alert
+    """
+    import os
+    night_date = start_date
+    date_utc = datetime(
+        night_date.year, night_date.month, night_date.day,
+        tzinfo=timezone.utc
+    )
+
+    # Darkness window
+    dark_start, dark_end = find_darkness_window(location, date_utc, TIMEZONE_OFFSET)
+    if dark_start is None:
+        return  # no darkness tonight, nothing to report
+
+    dark_hours = (dark_end - dark_start).to(u.hour).value
+
+    # Moon
+    midnight_utc = Time(
+        f"{night_date.strftime('%Y-%m-%d')}T07:00:00", scale="utc"
+    )
+    moon_midnight = get_body("moon", midnight_utc, location)
+    sun_midnight = get_sun(midnight_utc)
+    elong = moon_midnight.separation(sun_midnight)
+    moon_illum = (1 - math.cos(elong.rad)) / 2 * 100
+    moon_altaz = moon_midnight.transform_to(
+        AltAz(obstime=midnight_utc, location=location)
+    )
+    moon_status = (f"alt {moon_altaz.alt.deg:+.0f}°" if moon_altaz.alt.deg > -5
+                   else "below horizon")
+
+    # Weather
+    weather = fetch_night_weather(dark_start, dark_end)
+
+    # Targets
+    targets = parse_catalog_coords(DSO_CATALOG)
+    results = compute_night_batch(
+        targets, DSO_CATALOG, location, dark_start, dark_end,
+        min_alt, min_moon_sep,
+    )
+    results.sort(key=lambda r: r["score"], reverse=True)
+
+    n_excellent = sum(1 for r in results if r["score"] >= 75)
+    n_good = sum(1 for r in results if 55 <= r["score"] < 75)
+
+    # Evaluate
+    grade, reasons = evaluate_night(weather, moon_illum, n_excellent, n_good)
+
+    # Check for ISS lunar transits tonight
+    iss_tonight = check_iss_transits_for_nights(start_date, 1)
+    iss_events = iss_tonight.get(night_date, [])
+    has_iss_transit = any(e["is_transit"] for e in iss_events)
+
+    # ISS transit always triggers alert regardless of grade
+    grades_ranked = ["poor", "fair", "good", "excellent"]
+    if not has_iss_transit and grades_ranked.index(grade) < grades_ranked.index(min_grade):
+        # Below threshold and no ISS transit — stay silent (for cron)
+        quiet = not os.environ.get("ASTRO_EMAIL_TO")
+        if quiet:
+            print(f"Tonight: {grade} ({', '.join(reasons)}) — below {min_grade} threshold.")
+        return
+
+    # Build report
+    report = compose_alert_report(
+        night_date, grade, reasons, weather, moon_illum, moon_status,
+        dark_start, dark_end, dark_hours, results, min_alt, TIMEZONE_OFFSET,
+        iss_events=iss_events,
+    )
+
+    top_name = results[0]["name"] if results else "no targets"
+    if has_iss_transit:
+        subject = (f"Seestar Tonight: ISS LUNAR TRANSIT! "
+                   f"({grade}, {moon_illum:.0f}% moon)")
+    else:
+        subject = f"Seestar Tonight: {grade.upper()} — {top_name} + {len(results)-1} more"
+
+    # Try email, fall back to stdout
+    email_sent = send_email(subject, report)
+    if email_sent:
+        extra = " + ISS TRANSIT" if has_iss_transit else ""
+        print(f"Alert sent: {grade} night ({', '.join(reasons)}){extra}")
+    else:
+        # No email config or send failed — print report to stdout
+        print(report)
+
+
+def check_iss_transits_for_nights(start_date, days):
+    """
+    Try to find ISS lunar transits/near-misses for a date range.
+    Returns a dict mapping local date → list of transit result dicts.
+    Returns empty dict if skyfield is not installed or TLE fetch fails.
+    """
+    try:
+        results = find_iss_lunar_transits(start_date, days)
+    except Exception:
+        return {}
+
+    if not results:
+        return {}
+
+    tz = timezone(timedelta(hours=TIMEZONE_OFFSET))
+    by_night = {}
+    for r in results:
+        dt = r["time"].utc_datetime().replace(tzinfo=timezone.utc).astimezone(tz)
+        # A transit after midnight belongs to the previous evening's session
+        local_date = dt.date()
+        if dt.hour < 12:
+            local_date = local_date - timedelta(days=1)
+        by_night.setdefault(local_date, []).append(r)
+
+    return by_night
+
+
+def fetch_week_weather():
+    """
+    Fetch the full 7-day hourly forecast from NWS in one call.
+    Returns {date: [period, ...]} grouped by local date, or {} on failure.
+    """
+    import json
+    import urllib.request
+
+    headers = {"User-Agent": "(astroplanner, astro@example.com)"}
+
+    try:
+        req = urllib.request.Request(
+            f"https://api.weather.gov/points/{LATITUDE},{LONGITUDE}",
+            headers=headers,
+        )
+        resp = urllib.request.urlopen(req, timeout=10)
+        hourly_url = json.loads(resp.read().decode())["properties"]["forecastHourly"]
+    except Exception as e:
+        print(f"  Weather: could not resolve NWS grid — {e}")
+        return {}
+
+    try:
+        req = urllib.request.Request(hourly_url, headers=headers)
+        resp = urllib.request.urlopen(req, timeout=10)
+        forecast = json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"  Weather: could not fetch forecast — {e}")
+        return {}
+
+    return forecast["properties"]["periods"]
+
+
+def weather_for_night(all_periods, dark_start_utc, dark_end_utc):
+    """Extract weather for a single night's dark window from pre-fetched periods."""
+    if not all_periods:
+        return None
+
+    dark_start_dt = dark_start_utc.to_datetime(timezone=timezone.utc)
+    dark_end_dt = dark_end_utc.to_datetime(timezone=timezone.utc)
+
+    night_periods = []
+    for period in all_periods:
+        start = datetime.fromisoformat(period["startTime"])
+        end = datetime.fromisoformat(period["endTime"])
+        start_utc = start.astimezone(timezone.utc)
+        end_utc = end.astimezone(timezone.utc)
+
+        if end_utc <= dark_start_dt or start_utc >= dark_end_dt:
+            continue
+
+        short = period.get("shortForecast", "").lower()
+        cloud_pct = _parse_cloud_cover(short)
+        precip_pct = period.get("probabilityOfPrecipitation", {}).get("value") or 0
+        humidity = period.get("relativeHumidity", {}).get("value") or 0
+
+        night_periods.append({
+            "cloud_pct": cloud_pct,
+            "precip_pct": precip_pct,
+            "humidity": humidity,
+            "short_forecast": period.get("shortForecast", ""),
+        })
+
+    if not night_periods:
+        return None
+
+    avg_cloud = sum(p["cloud_pct"] for p in night_periods) / len(night_periods)
+    max_precip = max(p["precip_pct"] for p in night_periods)
+    avg_humidity = sum(p["humidity"] for p in night_periods) / len(night_periods)
+    forecasts = list(dict.fromkeys(p["short_forecast"] for p in night_periods))
+
+    return {
+        "avg_cloud_pct": avg_cloud,
+        "max_precip_pct": max_precip,
+        "avg_humidity": avg_humidity,
+        "forecasts": forecasts,
+        "n_hours": len(night_periods),
+    }
+
+
+def run_week(location, start_date, min_alt, min_moon_sep):
+    """
+    Evaluate the next 7 nights: weather, moon, targets.
+    Prints a ranked summary and highlights the best night(s).
+    Emails the report if email is configured.
+    """
+    targets = parse_catalog_coords(DSO_CATALOG)
+
+    print("  Fetching 7-day weather forecast...")
+    all_periods = fetch_week_weather()
+    if not all_periods:
+        print("  (Continuing without weather data.)")
+
+    # Check for ISS lunar transits this week
+    iss_by_night = check_iss_transits_for_nights(start_date, 7)
+
+    nights = []
+    for day_offset in range(7):
+        night_date = start_date + timedelta(days=day_offset)
+        date_utc = datetime(
+            night_date.year, night_date.month, night_date.day,
+            tzinfo=timezone.utc,
+        )
+
+        dark_start, dark_end = find_darkness_window(location, date_utc, TIMEZONE_OFFSET)
+        if dark_start is None:
+            continue
+
+        dark_hours = (dark_end - dark_start).to(u.hour).value
+
+        # Moon
+        midnight_utc = Time(
+            f"{night_date.strftime('%Y-%m-%d')}T07:00:00", scale="utc"
+        )
+        moon_mid = get_body("moon", midnight_utc, location)
+        sun_mid = get_sun(midnight_utc)
+        elong = moon_mid.separation(sun_mid)
+        moon_illum = (1 - math.cos(elong.rad)) / 2 * 100
+        moon_altaz = moon_mid.transform_to(
+            AltAz(obstime=midnight_utc, location=location)
+        )
+        moon_status = (f"alt {moon_altaz.alt.deg:+.0f}°" if moon_altaz.alt.deg > -5
+                       else "below horizon")
+
+        # Weather for this night from pre-fetched data
+        weather = weather_for_night(all_periods, dark_start, dark_end)
+
+        # Targets
+        results = compute_night_batch(
+            targets, DSO_CATALOG, location, dark_start, dark_end,
+            min_alt, min_moon_sep,
+        )
+        results.sort(key=lambda r: r["score"], reverse=True)
+
+        n_excellent = sum(1 for r in results if r["score"] >= 75)
+        n_good = sum(1 for r in results if 55 <= r["score"] < 75)
+
+        grade, reasons = evaluate_night(weather, moon_illum, n_excellent, n_good)
+
+        iss_events = iss_by_night.get(night_date, [])
+        has_transit = any(e["is_transit"] for e in iss_events)
+
+        nights.append({
+            "date": night_date,
+            "grade": grade,
+            "reasons": reasons,
+            "weather": weather,
+            "moon_illum": moon_illum,
+            "moon_status": moon_status,
+            "dark_start": dark_start,
+            "dark_end": dark_end,
+            "dark_hours": dark_hours,
+            "n_excellent": n_excellent,
+            "n_good": n_good,
+            "top_target": results[0] if results else None,
+            "results": results,
+            "iss_events": iss_events,
+            "has_iss_transit": has_transit,
+        })
+
+    # Build the report
+    lines = []
+    lines.append(f"SEESTAR S50 — Weekly Imaging Forecast")
+    lines.append(f"{'=' * 70}")
+    lines.append(f"{start_date.strftime('%b %d')} — "
+                 f"{(start_date + timedelta(days=6)).strftime('%b %d, %Y')}  "
+                 f"|  Sunnyvale, CA")
+    lines.append("")
+
+    grade_icon = {"excellent": ">>>", "good": " >>", "fair": "  >", "poor": "   "}
+    grade_bar = {"excellent": "████", "good": "███░", "fair": "██░░", "poor": "█░░░"}
+
+    # Find best night
+    grades_rank = {"excellent": 4, "good": 3, "fair": 2, "poor": 1}
+    best = max(nights, key=lambda n: grades_rank[n["grade"]]) if nights else None
+
+    # Any ISS transits this week?
+    any_iss = any(n["iss_events"] for n in nights)
+
+    # Summary table
+    lines.append(f"  {'NIGHT':<16} {'GRADE':<12} {'WEATHER':<22} "
+                 f"{'MOON':>5} {'DARK':>5} {'#TOP':>4}")
+    lines.append(f"  {'-' * 66}")
+
+    for n in nights:
+        is_best = (n is best and grades_rank[n["grade"]] >= 2)
+        marker = " *" if is_best else "  "
+
+        if n["weather"]:
+            cloud_str = f"{n['weather']['avg_cloud_pct']:2.0f}% cloud"
+            if n["weather"]["max_precip_pct"] > 10:
+                cloud_str += f", {n['weather']['max_precip_pct']}% rain"
+            if len(cloud_str) > 21:
+                cloud_str = cloud_str[:21]
+        else:
+            cloud_str = "no forecast"
+
+        iss_flag = ""
+        if n["has_iss_transit"]:
+            iss_flag = "  ISS TRANSIT!"
+        elif n["iss_events"]:
+            iss_flag = "  ISS near"
+
+        lines.append(
+            f"  {n['date'].strftime('%a %b %d'):<16} "
+            f"{grade_bar[n['grade']]} {n['grade']:<7} "
+            f"{cloud_str:<22} "
+            f"{n['moon_illum']:3.0f}% "
+            f"{n['dark_hours']:4.1f}h "
+            f"{n['n_excellent']:>3}{marker}{iss_flag}"
+        )
+
+    lines.append("")
+
+    if best and grades_rank[best["grade"]] >= 2:
+        lines.append(f"  * BEST NIGHT: {best['date'].strftime('%A, %b %d')} "
+                     f"({best['grade']})")
+    elif best:
+        lines.append(f"  No great nights this week — best is "
+                     f"{best['date'].strftime('%a %b %d')} ({best['grade']})")
+    lines.append("")
+
+    # Detail for each fair+ night, OR any night with ISS events
+    for n in nights:
+        show_detail = grades_rank[n["grade"]] >= 2 or n["iss_events"]
+        if not show_detail:
+            continue
+
+        lines.append(f"{'─' * 70}")
+        header = f"  {n['date'].strftime('%A, %b %d')}  —  {n['grade'].upper()}"
+        if n["has_iss_transit"]:
+            header += "  (ISS LUNAR TRANSIT)"
+        lines.append(header)
+        lines.append(f"  {', '.join(n['reasons'])}")
+        lines.append(f"  Dark: {utc_to_local(n['dark_start'], TIMEZONE_OFFSET)}-"
+                     f"{utc_to_local(n['dark_end'], TIMEZONE_OFFSET)} {TIMEZONE_NAME} "
+                     f"({n['dark_hours']:.1f}h)  |  Moon: {n['moon_illum']:.0f}% {n['moon_status']}")
+
+        if n["weather"] and n["weather"]["forecasts"]:
+            lines.append(f"  Forecast: {' → '.join(n['weather']['forecasts'])}")
+
+        # ISS transit details
+        if n["iss_events"]:
+            tz = timezone(timedelta(hours=TIMEZONE_OFFSET))
+            for ev in n["iss_events"]:
+                dt = ev["time"].utc_datetime().replace(tzinfo=timezone.utc).astimezone(tz)
+                if ev["is_transit"]:
+                    lines.append(f"  >>> ISS LUNAR TRANSIT at {dt.strftime('%H:%M:%S')} {TIMEZONE_NAME}"
+                                 f"  ({ev['transit_duration_s']:.1f}s, "
+                                 f"{ev['min_sep']:.3f}° from center)")
+                    if n["moon_illum"] >= 50:
+                        lines.append(f"      Bright moon is ideal — ISS silhouette "
+                                     f"against {n['moon_illum']:.0f}% illuminated disk")
+                else:
+                    lines.append(f"  ISS near miss at {dt.strftime('%H:%M:%S')} {TIMEZONE_NAME}"
+                                 f"  ({ev['min_sep']:.2f}° from center)")
+
+        top5 = n["results"][:5]
+        if top5:
+            lines.append(f"  Top targets:")
+            for r in top5:
+                display = f"{r['name']} {r['common']}"
+                if len(display) > 25:
+                    display = display[:25]
+                window = (f"{utc_to_local(r['window_start'], TIMEZONE_OFFSET)}-"
+                          f"{utc_to_local(r['window_end'], TIMEZONE_OFFSET)}")
+                lines.append(f"    {display:<26} {r['score']:>3.0f}  "
+                             f"{r['peak_alt']:>4.0f}° {window}  "
+                             f"{r['hours_above']:.1f}h")
+        lines.append("")
+
+    report = "\n".join(lines)
+
+    # Print to stdout
+    print(report)
+
+    # Also email if configured
+    good_nights = sum(1 for n in nights if grades_rank[n["grade"]] >= 3)
+    if best:
+        subject = (f"Seestar Week: {good_nights} good night{'s' if good_nights != 1 else ''} — "
+                   f"best {best['date'].strftime('%a %b %d')} ({best['grade']})")
+        if send_email(subject, report):
+            print(f"  (Email sent)")
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────
 
@@ -680,6 +1420,23 @@ def main():
         "--iss-transits", action="store_true",
         help="Search for ISS lunar transit opportunities (requires: pip install skyfield)"
     )
+    parser.add_argument(
+        "--alert", action="store_true",
+        help="Check tonight's conditions and email a report if imaging-worthy. "
+             "Configure email via env vars: ASTRO_EMAIL_TO, ASTRO_EMAIL_FROM, "
+             "ASTRO_EMAIL_PASS, ASTRO_SMTP_HOST, ASTRO_SMTP_PORT. "
+             "Prints to stdout if email is not configured."
+    )
+    parser.add_argument(
+        "--min-grade", type=str, default="fair",
+        choices=["poor", "fair", "good", "excellent"],
+        help="Minimum night grade to trigger alert (default: fair)"
+    )
+    parser.add_argument(
+        "--week", action="store_true",
+        help="7-day imaging forecast with weather, moon, and ranked nights. "
+             "Emails report if ASTRO_EMAIL_* env vars are set."
+    )
     args = parser.parse_args()
 
     location = EarthLocation(
@@ -693,18 +1450,28 @@ def main():
     # If it's after noon, "tonight" means today's evening
     start_date = local_now.date()
 
-    print("=" * 78)
-    print(f"  SEESTAR S50 OBSERVATION PLANNER")
-    print(f"  Location: Sunnyvale, CA ({LATITUDE:.2f}°N, {LONGITUDE:.2f}°W)")
-    print(f"  Min altitude: {args.min_alt}°  |  Min moon separation: {args.min_moon_sep}°")
-    print(f"  Date range: {start_date.strftime('%b %d')} — "
-          f"{(start_date + timedelta(days=args.days-1)).strftime('%b %d, %Y')}")
-    print(f"  Catalog: {len(DSO_CATALOG)} deep sky objects")
-    print("=" * 78)
+    if not args.alert:
+        print("=" * 78)
+        print(f"  SEESTAR S50 OBSERVATION PLANNER")
+        print(f"  Location: Sunnyvale, CA ({LATITUDE:.2f}°N, {LONGITUDE:.2f}°W)")
+        print(f"  Min altitude: {args.min_alt}°  |  Min moon separation: {args.min_moon_sep}°")
+        print(f"  Date range: {start_date.strftime('%b %d')} — "
+              f"{(start_date + timedelta(days=args.days-1)).strftime('%b %d, %Y')}")
+        print(f"  Catalog: {len(DSO_CATALOG)} deep sky objects")
+        print("=" * 78)
 
     if args.iss_transits:
         results = find_iss_lunar_transits(start_date, args.days)
         print_iss_transits(results, start_date, args.days, TIMEZONE_OFFSET)
+        return
+
+    if args.alert:
+        run_alert(location, start_date, args.min_alt, args.min_moon_sep,
+                  args.min_grade)
+        return
+
+    if args.week:
+        run_week(location, start_date, args.min_alt, args.min_moon_sep)
         return
 
     # Pre-parse all catalog coordinates once (avoids re-parsing strings each night)
