@@ -284,10 +284,13 @@ def find_darkness_window(location, date_utc, tz_offset):
     Find the window of astronomical darkness (sun < -18°) for a given night.
     Returns (dark_start_utc, dark_end_utc) or (None, None) if no full darkness.
     """
-    # Scan from local sunset (~02:00 UTC for PDT) to sunrise (~14:00 UTC)
-    # with 5-minute resolution
-    start = Time(f"{date_utc.strftime('%Y-%m-%d')}T01:00:00", scale="utc")
-    times = start + np.arange(0, 16 * 60, 5) * u.min
+    # Scan from local evening to next morning in UTC.
+    # For a local date, sunset happens on that date but in UTC it may be
+    # the next day (e.g. 7pm PDT Apr 3 = 02:00 UTC Apr 4).
+    # Start scanning at local noon (safe before any sunset) and go 20 hours.
+    local_noon_utc_hour = 12 - tz_offset  # noon local in UTC hours
+    start = Time(f"{date_utc.strftime('%Y-%m-%d')}T{local_noon_utc_hour:02d}:00:00", scale="utc")
+    times = start + np.arange(0, 20 * 60, 5) * u.min
 
     altaz_frame = AltAz(obstime=times, location=location)
     sun_alts = get_sun(times).transform_to(altaz_frame).alt.deg
