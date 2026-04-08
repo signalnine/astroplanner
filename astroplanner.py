@@ -45,6 +45,20 @@ ELEVATION = 30           # meters
 TIMEZONE_OFFSET = -7     # PDT (change to -8 for PST)
 TIMEZONE_NAME = "PDT"
 
+# Seestar S50 telescope connection
+# Set SEESTAR_IP to your telescope's IP. Tip: assign a static DHCP lease
+# in your router so this never changes.
+SEESTAR_IP = None             # e.g. "192.168.1.100"
+SEESTAR_PORT = 4700
+
+# LP filter auto-selection by object type
+# True = dual-band (Ha+OIII), False = UV/IR cut (clear)
+LP_FILTER_AUTO = {
+    "emission": True, "SNR": True, "planetary": True,
+    "galaxy": False, "globular": False, "open cluster": False,
+    "reflection": False, "dark": False,
+}
+
 # ──────────────────────────────────────────────────────────────────────
 # DSO catalog — complete Messier (M1-M110) plus select NGC/IC targets
 # Optimized for Seestar S50 (50mm aperture, stacking, LP filter)
@@ -409,6 +423,12 @@ def utc_to_local_date(t, tz_offset):
     return dt.strftime("%b %d")
 
 
+def observe_log(msg):
+    """Print a timestamped log line for observe mode."""
+    ts = datetime.now(timezone(timedelta(hours=TIMEZONE_OFFSET))).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # ISS lunar transit prediction
 # ──────────────────────────────────────────────────────────────────────
@@ -641,6 +661,605 @@ def print_iss_transits(results, start_date, days, tz_offset):
     print(f"  NOTE: ISS predictions degrade beyond ~1-2 weeks due to orbital maneuvers.")
     print(f"  Rerun closer to the date for precise timing. Transits last < 2 seconds")
     print(f"  — use video mode or a high-speed camera, not long-exposure stacking.")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Seestar S50 telescope control
+# ──────────────────────────────────────────────────────────────────────
+
+import json as _json
+import socket
+import threading
+import time as _time
+
+
+class SeestarConnection:
+    """Low-level TCP connection to a Seestar S50 telescope (port 4700).
+
+    Protocol: JSON messages over raw TCP, terminated by \\r\\n.
+    Responses are matched by message id; async events have an 'Event' key.
+    """
+
+    def __init__(self, ip, port=4700, timeout=10):
+        self.ip = ip
+        self.port = port
+        self.timeout = timeout
+        self._sock = None
+        self._msg_id = 1000
+        self._id_lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._resp_lock = threading.Lock()
+        self._responses = {}   # msg_id -> {"event": Event, "result": dict}
+        self._events = []      # async events from telescope
+        self._event_lock = threading.Lock()
+        self._reader_thread = None
+        self._connected = False
+        self._recv_buf = b""
+
+    def connect(self):
+        """Connect to the telescope. Sends UDP discovery first."""
+        # Stop any existing connection/threads first
+        if self._connected:
+            self.disconnect()
+
+        # UDP discovery broadcast (guest mode)
+        try:
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            udp.settimeout(2)
+            msg = _json.dumps({"id": 1, "method": "scan_iscope", "params": ""})
+            udp.sendto(msg.encode() + b"\r\n", (self.ip, 4720))
+            udp.close()
+        except Exception:
+            pass  # non-fatal -- direct TCP may still work
+
+        _time.sleep(0.5)
+
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.settimeout(self.timeout)
+        self._sock.connect((self.ip, self.port))
+        self._connected = True
+        self._recv_buf = b""
+
+        # Start reader thread
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
+
+    def disconnect(self):
+        """Close the connection and stop reader thread."""
+        self._connected = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+        if self._reader_thread:
+            self._reader_thread.join(timeout=5)
+            self._reader_thread = None
+
+    def send(self, method, params=None, timeout=30):
+        """Send a command and wait for the response. Returns the response dict."""
+        with self._id_lock:
+            self._msg_id += 1
+            msg_id = self._msg_id
+
+        msg = {"id": msg_id, "method": method}
+        if params is not None:
+            msg["params"] = params
+
+        event = threading.Event()
+        with self._resp_lock:
+            self._responses[msg_id] = {"event": event, "result": None}
+
+        raw = _json.dumps(msg) + "\r\n"
+        with self._write_lock:
+            self._sock.sendall(raw.encode())
+
+        if event.wait(timeout):
+            with self._resp_lock:
+                resp = self._responses.pop(msg_id, {})
+            return resp.get("result")
+        else:
+            with self._resp_lock:
+                self._responses.pop(msg_id, None)
+            raise TimeoutError(f"No response to {method} (id={msg_id}) within {timeout}s")
+
+    def send_no_wait(self, method, params=None):
+        """Send a command without waiting for a response."""
+        with self._id_lock:
+            self._msg_id += 1
+            msg_id = self._msg_id
+
+        msg = {"id": msg_id, "method": method}
+        if params is not None:
+            msg["params"] = params
+
+        raw = _json.dumps(msg) + "\r\n"
+        with self._write_lock:
+            self._sock.sendall(raw.encode())
+        return msg_id
+
+    def wait_for_event(self, event_name, states=("complete", "fail"), timeout=300):
+        """Wait for an async event to reach a terminal state."""
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            with self._event_lock:
+                for i, ev in enumerate(self._events):
+                    if ev.get("Event") == event_name and ev.get("state") in states:
+                        self._events.pop(i)
+                        return ev
+            _time.sleep(0.5)
+        raise TimeoutError(f"Event {event_name} not received within {timeout}s")
+
+    def drain_events(self, event_name=None):
+        """Remove and return all pending events, optionally filtered by name."""
+        with self._event_lock:
+            if event_name:
+                matched = [e for e in self._events if e.get("Event") == event_name]
+                self._events = [e for e in self._events if e.get("Event") != event_name]
+            else:
+                matched = list(self._events)
+                self._events.clear()
+        return matched
+
+    @property
+    def connected(self):
+        return self._connected
+
+    def _reader_loop(self):
+        """Background thread: read TCP stream, parse JSON messages, dispatch."""
+        while self._connected:
+            try:
+                data = self._sock.recv(65536)
+                if not data:
+                    self._connected = False
+                    break
+                self._recv_buf += data
+
+                while b"\r\n" in self._recv_buf:
+                    line, self._recv_buf = self._recv_buf.split(b"\r\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = _json.loads(line.decode("utf-8", errors="replace"))
+                    except (_json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+
+                    # Command response (matched by id)
+                    if "id" in msg:
+                        with self._resp_lock:
+                            if msg["id"] in self._responses:
+                                entry = self._responses[msg["id"]]
+                                entry["result"] = msg
+                                entry["event"].set()
+                    # Async event
+                    if "Event" in msg:
+                        with self._event_lock:
+                            self._events.append(msg)
+
+            except socket.timeout:
+                continue
+            except OSError:
+                self._connected = False
+                break
+
+
+class SeestarTelescope:
+    """High-level Seestar S50 control: goto, stack, filter, status."""
+
+    def __init__(self, ip, port=4700):
+        self.conn = SeestarConnection(ip, port)
+        self._heartbeat_thread = None
+        self._stop_heartbeat = threading.Event()
+
+    def connect(self):
+        # Stop any existing heartbeat thread before reconnecting
+        self._stop_heartbeat.set()
+        if self._heartbeat_thread:
+            self._heartbeat_thread.join(timeout=10)
+            self._heartbeat_thread = None
+        self.conn.connect()
+        # Start heartbeat (scope_get_equ_coord every 5s)
+        self._stop_heartbeat.clear()
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat, daemon=True)
+        self._heartbeat_thread.start()
+
+    def disconnect(self):
+        self._stop_heartbeat.set()
+        if self._heartbeat_thread:
+            self._heartbeat_thread.join(timeout=10)
+            self._heartbeat_thread = None
+        try:
+            self.conn.send("iscope_stop_view", timeout=5)
+        except Exception:
+            pass
+        self.conn.disconnect()
+
+    def goto(self, ra_j2000_hours, dec_j2000_deg, target_name, lp_filter=False):
+        """
+        Slew to target with plate-solving.
+        RA/Dec are J2000; converted to JNow internally.
+        Returns True on success, False on failure.
+        """
+        from astropy.coordinates import FK5
+        from astropy.time import Time as AstroTime
+        coord = SkyCoord(ra=ra_j2000_hours * u.hourangle, dec=dec_j2000_deg * u.deg,
+                         frame="icrs")
+        now = AstroTime.now()
+        jnow = coord.transform_to(FK5(equinox=now))
+        ra_jnow = jnow.ra.hour
+        dec_jnow = jnow.dec.deg
+
+        # Drain any old AutoGoto events
+        self.conn.drain_events("AutoGoto")
+
+        self.conn.send("iscope_start_view", {
+            "mode": "star",
+            "target_ra_dec": [ra_jnow, dec_jnow],
+            "target_name": target_name,
+            "lp_filter": lp_filter,
+        }, timeout=10)
+
+        # Wait for goto to complete (up to 5 minutes)
+        ev = self.conn.wait_for_event("AutoGoto", timeout=300)
+        if ev.get("state") == "complete":
+            _time.sleep(3)  # settling time before stacking
+            return True
+        return False
+
+    def start_stacking(self):
+        """Start live stacking. Returns True on success."""
+        resp = self.conn.send("iscope_start_stack", {"restart": True}, timeout=10)
+        return resp is not None and resp.get("code", -1) == 0
+
+    def stop_stacking(self):
+        """Stop current stacking session."""
+        try:
+            self.conn.send("iscope_stop_view", {"stage": "Stack"}, timeout=10)
+        except Exception:
+            pass
+
+    def set_lp_filter(self, enabled):
+        """Set LP filter. True = dual-band ON, False = clear/UV-IR cut."""
+        self.conn.send("set_setting", {"stack_lenhance": enabled}, timeout=10)
+        _time.sleep(2)  # wait for filter wheel
+
+    def get_position(self):
+        """Get current RA/Dec (JNow). Returns (ra_hours, dec_deg) or None."""
+        resp = self.conn.send("scope_get_equ_coord", timeout=5)
+        if resp and "result" in resp:
+            return resp["result"].get("ra"), resp["result"].get("dec")
+        return None
+
+    def get_view_state(self):
+        """Query telescope view state. Returns response dict or None."""
+        try:
+            resp = self.conn.send("get_view_state", timeout=5)
+            return resp
+        except Exception:
+            return None
+
+    def is_connected(self):
+        return self.conn.connected
+
+    def _heartbeat(self):
+        """Send heartbeat every 5 seconds to keep connection alive."""
+        while not self._stop_heartbeat.wait(5):
+            if not self.conn.connected:
+                break
+            try:
+                self.conn.send_no_wait("scope_get_equ_coord")
+            except Exception:
+                break
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Observe mode — automated imaging session
+# ──────────────────────────────────────────────────────────────────────
+
+def select_observe_targets(location, start_date, min_alt, min_moon_sep, type_filter=None):
+    """
+    Select targets for observe mode, ranked by adjusted score.
+    Filters out targets with < 1 hour remaining and penalizes short windows.
+    Returns (sorted list of result dicts, dark_start, dark_end).
+    """
+    date_utc = datetime(start_date.year, start_date.month, start_date.day,
+                        tzinfo=timezone.utc)
+
+    dark_start, dark_end = find_darkness_window(location, date_utc, TIMEZONE_OFFSET)
+    if dark_start is None:
+        return [], None, None
+
+    targets = parse_catalog_coords(DSO_CATALOG)
+    results = compute_night_batch(
+        targets, DSO_CATALOG, location, dark_start, dark_end,
+        min_alt, min_moon_sep, type_filter=type_filter,
+    )
+
+    # Filter and adjust scores based on remaining observable time
+    now_time = Time(datetime.now(timezone.utc))
+    filtered = []
+    for r in results:
+        effective_start = max(r["window_start"], now_time)
+        remaining = (r["window_end"] - effective_start).to(u.hour).value
+        if remaining < 1.0:
+            continue
+        r["remaining_hours"] = remaining
+        r["adjusted_score"] = r["score"] * min(1.0, remaining / 3.0)
+        filtered.append(r)
+
+    filtered.sort(key=lambda r: r["adjusted_score"], reverse=True)
+    return filtered, dark_start, dark_end
+
+
+def run_observe(location, start_date, min_alt, min_moon_sep, type_filter, lp_filter_mode):
+    """
+    Automated observe session: connect to Seestar, pick best target,
+    image it for as long as possible with one fallback.
+    """
+    observe_log("Starting observe session")
+
+    # 1. Select targets
+    candidates, dark_start, dark_end = select_observe_targets(
+        location, start_date, min_alt, min_moon_sep, type_filter
+    )
+    if not candidates:
+        observe_log("No observable targets tonight.")
+        return
+
+    observe_log(f"Dark window: {utc_to_local(dark_start, TIMEZONE_OFFSET)}-"
+                f"{utc_to_local(dark_end, TIMEZONE_OFFSET)} {TIMEZONE_NAME}")
+    observe_log(f"Top candidates: " +
+                ", ".join(f"{r['name']}({r['adjusted_score']:.0f})" for r in candidates[:5]))
+
+    # 2. Connect to telescope
+    observe_log(f"Connecting to Seestar at {SEESTAR_IP}:{SEESTAR_PORT}...")
+    scope = SeestarTelescope(SEESTAR_IP, SEESTAR_PORT)
+    try:
+        scope.connect()
+    except Exception as e:
+        observe_log(f"FATAL: Cannot connect to telescope -- {e}")
+        observe_log(f"Check SEESTAR_IP setting (currently: {SEESTAR_IP})")
+        _send_observe_email("Connection failed", str(e), [])
+        return
+
+    observe_log("Connected to Seestar S50")
+    session_log = []  # list of (target_name, start_time, end_time, status)
+    fallback_used = False
+
+    try:
+        target_idx = 0
+        while target_idx < len(candidates) and (not fallback_used or target_idx <= 1):
+            target = candidates[target_idx]
+            result = _observe_target(scope, target, location, dark_end, min_alt,
+                                     lp_filter_mode, session_log)
+            if result == "done":
+                break
+            elif result == "target_set":
+                if not fallback_used:
+                    observe_log("Primary target set. Attempting fallback...")
+                    fallback_used = True
+                    now_time = Time(datetime.now(timezone.utc))
+                    remaining = [
+                        r for r in candidates[target_idx + 1:]
+                        if (r["window_end"] - now_time).to(u.hour).value >= 1.0
+                    ]
+                    if remaining:
+                        candidates = remaining
+                        target_idx = 0
+                        continue
+                    else:
+                        observe_log("No viable fallback targets remaining.")
+                        break
+                else:
+                    break
+            elif result == "error":
+                break
+            target_idx += 1
+    finally:
+        observe_log("Stopping telescope...")
+        scope.disconnect()
+        _print_session_summary(session_log)
+
+
+def _observe_target(scope, target, location, dark_end, min_alt, lp_filter_mode, session_log):
+    """
+    Observe a single target. Returns:
+      "done" -- dark window ended
+      "target_set" -- target below min altitude
+      "error" -- unrecoverable error
+    """
+    name = target["name"]
+    common = target["common"]
+    obj_type = target["type"]
+
+    # Determine LP filter setting
+    if lp_filter_mode == "on":
+        use_lp = True
+    elif lp_filter_mode == "off":
+        use_lp = False
+    else:
+        use_lp = LP_FILTER_AUTO.get(obj_type, False)
+
+    lp_str = "ON" if use_lp else "OFF"
+    observe_log(f"Target: {name} ({common}) -- {obj_type}, LP filter {lp_str}")
+    observe_log(f"Window: until {utc_to_local(target['window_end'], TIMEZONE_OFFSET)} "
+                f"{TIMEZONE_NAME} ({target['remaining_hours']:.1f}h remaining)")
+
+    # Set LP filter
+    try:
+        scope.set_lp_filter(use_lp)
+    except Exception as e:
+        observe_log(f"Warning: LP filter set failed -- {e}")
+
+    # Get J2000 RA/Dec from catalog
+    cat_entry = next(c for c in DSO_CATALOG if c[0] == name)
+    coord = SkyCoord(ra=cat_entry[2], dec=cat_entry[3])
+    ra_hours = coord.ra.hour
+    dec_deg = coord.dec.deg
+
+    # Goto
+    observe_log(f"Slewing to {name}...")
+    start_time = datetime.now(timezone.utc)
+
+    goto_success = False
+    for attempt in range(3):
+        try:
+            goto_success = scope.goto(ra_hours, dec_deg, name, lp_filter=use_lp)
+            if goto_success:
+                break
+        except Exception as e:
+            observe_log(f"Goto attempt {attempt + 1} failed: {e}")
+            if attempt < 2:
+                _time.sleep(10)
+
+    if not goto_success:
+        observe_log(f"FAILED: Could not slew to {name}")
+        session_log.append((name, start_time, datetime.now(timezone.utc), "goto_failed"))
+        return "target_set"  # try fallback
+
+    # Start stacking
+    observe_log(f"Starting stacking on {name}...")
+    if not scope.start_stacking():
+        observe_log(f"FAILED: Could not start stacking on {name}")
+        session_log.append((name, start_time, datetime.now(timezone.utc), "stack_failed"))
+        return "target_set"
+
+    observe_log(f"Stacking {name}. Monitoring...")
+
+    # Monitor loop
+    last_status_log = _time.time()
+    stack_start = _time.time()
+    backoff_delays = [10, 20, 40, 80, 160]
+
+    while True:
+        _time.sleep(60)
+
+        # Check dark window
+        now_utc = Time(datetime.now(timezone.utc).isoformat(), scale="utc")
+        if now_utc >= dark_end:
+            elapsed = (_time.time() - stack_start) / 3600
+            observe_log(f"Dark window ended. Stacked {name} for {elapsed:.1f}h")
+            scope.stop_stacking()
+            session_log.append((name, start_time, datetime.now(timezone.utc), "complete"))
+            return "done"
+
+        # Check target altitude
+        altaz_frame = AltAz(obstime=now_utc, location=location)
+        target_coord = SkyCoord(ra=ra_hours * u.hourangle, dec=dec_deg * u.deg)
+        alt = target_coord.transform_to(altaz_frame).alt.deg
+        if alt < min_alt:
+            elapsed = (_time.time() - stack_start) / 3600
+            observe_log(f"{name} below {min_alt}deg (alt={alt:.1f}deg). "
+                        f"Stacked for {elapsed:.1f}h")
+            scope.stop_stacking()
+            session_log.append((name, start_time, datetime.now(timezone.utc), "target_set"))
+            return "target_set"
+
+        # Check if stacking is still active
+        if scope.is_connected():
+            view_state = scope.get_view_state()
+            if view_state and view_state.get("result"):
+                state_info = view_state["result"]
+                # If telescope reports it's no longer stacking, restart
+                stage = state_info.get("stage", "")
+                if isinstance(stage, str) and stage and "Stack" not in stage:
+                    observe_log(f"Stacking appears to have stopped (stage={stage}). Restarting...")
+                    if not scope.start_stacking():
+                        observe_log("Failed to restart stacking.")
+                        session_log.append((name, start_time, datetime.now(timezone.utc),
+                                            "stack_failed"))
+                        return "target_set"
+                    observe_log("Stacking restarted.")
+
+        # Check connection
+        if not scope.is_connected():
+            observe_log("Connection lost. Attempting reconnect...")
+            reconnected = False
+            for i in range(5):
+                delay = backoff_delays[min(i, len(backoff_delays) - 1)]
+                observe_log(f"Retry {i + 1}/5 in {delay}s...")
+                _time.sleep(delay)
+                try:
+                    scope.connect()
+                    pos = scope.get_position()
+                    if pos:
+                        observe_log(f"Reconnected. Position: RA={pos[0]:.4f} Dec={pos[1]:.4f}")
+                        # Check if still on-target (TCP drop may not stop telescope)
+                        ra_diff = abs(pos[0] - ra_hours) * 15  # rough arcmin
+                        dec_diff = abs(pos[1] - dec_deg) * 60
+                        if ra_diff < 5 and dec_diff < 5:
+                            observe_log("Telescope still on target. Resuming monitor.")
+                            reconnected = True
+                            break
+                        observe_log(f"Off target. Re-acquiring {name}...")
+                        if scope.goto(ra_hours, dec_deg, name, lp_filter=use_lp):
+                            if scope.start_stacking():
+                                observe_log("Stacking resumed.")
+                                reconnected = True
+                                break
+                except Exception as e:
+                    observe_log(f"Reconnect attempt failed: {e}")
+
+            if not reconnected:
+                observe_log("FATAL: Could not reconnect after 5 attempts.")
+                session_log.append((name, start_time, datetime.now(timezone.utc),
+                                    "connection_lost"))
+                _send_observe_email(
+                    "Connection lost",
+                    f"Lost connection while imaging {name}. 5 reconnect attempts failed.",
+                    session_log)
+                return "error"
+
+        # Periodic status log (every 10 min)
+        if _time.time() - last_status_log >= 600:
+            elapsed = (_time.time() - stack_start) / 60
+            observe_log(f"Stacking {name}: {elapsed:.0f} min elapsed, alt={alt:.1f}deg")
+            last_status_log = _time.time()
+
+
+def _send_observe_email(subject_detail, body_detail, session_log):
+    """Send an email alert on observe session events. Falls back to stdout."""
+    lines = [f"Observe session: {subject_detail}", "", body_detail, ""]
+    if session_log:
+        lines.append("Session log:")
+        for name, start, end, status in session_log:
+            duration = (end - start).total_seconds() / 3600
+            lines.append(f"  {name}: {duration:.1f}h -- {status}")
+    body = "\n".join(lines)
+    subject = f"Seestar: {subject_detail}"
+    if not send_email(subject, body):
+        observe_log(body)
+
+
+def _print_session_summary(session_log):
+    """Print observe session summary."""
+    if not session_log:
+        observe_log("Session complete. No targets were imaged.")
+        return
+
+    observe_log("=" * 60)
+    observe_log("SESSION SUMMARY")
+    total_hours = 0
+    for name, start, end, status in session_log:
+        duration = (end - start).total_seconds() / 3600
+        total_hours += duration
+        status_str = {"complete": "ok", "target_set": "target set",
+                      "goto_failed": "goto failed", "stack_failed": "stack failed",
+                      "connection_lost": "connection lost"}.get(status, status)
+        observe_log(f"  {name}: {duration:.1f}h -- {status_str}")
+    observe_log(f"Total imaging time: {total_hours:.1f}h")
+    observe_log("=" * 60)
+
+    # Email summary
+    lines = ["Seestar observe session complete.", ""]
+    for name, start, end, status in session_log:
+        duration = (end - start).total_seconds() / 3600
+        lines.append(f"{name}: {duration:.1f}h ({status})")
+    lines.append(f"\nTotal: {total_hours:.1f}h")
+    send_email(f"Seestar: session complete -- {total_hours:.1f}h imaging", "\n".join(lines))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1440,6 +2059,16 @@ def main():
         help="7-day imaging forecast with weather, moon, and ranked nights. "
              "Emails report if ASTRO_EMAIL_* env vars are set."
     )
+    parser.add_argument(
+        "--observe", action="store_true",
+        help="Connect to Seestar S50 and image the best target tonight. "
+             "Requires SEESTAR_IP to be set in config."
+    )
+    parser.add_argument(
+        "--lp-filter", type=str, default="auto",
+        choices=["on", "off", "auto"],
+        help="LP filter mode for --observe (default: auto, selects by object type)"
+    )
     args = parser.parse_args()
 
     location = EarthLocation(
@@ -1471,6 +2100,14 @@ def main():
     if args.alert:
         run_alert(location, start_date, args.min_alt, args.min_moon_sep,
                   args.min_grade)
+        return
+
+    if args.observe:
+        if SEESTAR_IP is None:
+            print("Error: Set SEESTAR_IP in astroplanner.py config section.")
+            sys.exit(1)
+        run_observe(location, start_date, args.min_alt, args.min_moon_sep,
+                    args.type, args.lp_filter)
         return
 
     if args.week:
