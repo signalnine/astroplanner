@@ -48,7 +48,7 @@ TIMEZONE_NAME = "PDT"
 # Seestar S50 telescope connection
 # Set SEESTAR_IP to your telescope's IP. Tip: assign a static DHCP lease
 # in your router so this never changes.
-SEESTAR_IP = None             # e.g. "192.168.1.100"
+SEESTAR_IP = "192.168.1.216"
 SEESTAR_PORT = 4700
 
 # LP filter auto-selection by object type
