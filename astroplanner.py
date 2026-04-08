@@ -2098,6 +2098,23 @@ def main():
                     if r["notes"]:
                         print(f"    Tip: {r['notes']}")
 
+    if args.tonight and SEESTAR_IP and results:
+        top = results[0]
+        use_lp = LP_FILTER_AUTO.get(top["type"], False)
+        lp_str = "LP (dual-band)" if use_lp else "IR (clear)"
+        print(f"\n{'=' * 78}")
+        print(f"  AUTOMATED OBSERVING")
+        print(f"  {'─' * 74}")
+        print(f"  To image tonight's top target automatically:")
+        print(f"    1. Power on the Seestar and let it connect to WiFi")
+        print(f"    2. Open the phone app, open the arm, then close the app")
+        print(f"    3. Run: python astroplanner.py --observe")
+        print(f"")
+        print(f"  The telescope will slew to {top['name']} ({top['common']}),")
+        print(f"  set the {lp_str} filter, and stack for {top['hours_above']:.1f}h.")
+        print(f"  At dawn it will park the telescope and email a summary.")
+        print(f"{'=' * 78}")
+
     if not args.tonight and n_days > 1:
         print(f"\n{'=' * 78}")
         print(f"  TIP: Run with --tonight for detailed notes, or --best-nights")
