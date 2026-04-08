@@ -44,21 +44,28 @@ ON = dual-band (Ha + OIII). OFF = UV/IR cut (clear).
 
 Log the filter choice per target.
 
-## WebSocket Protocol Layer
+## TCP Protocol Layer
 
-Self-contained `SeestarConnection` class. JSON messages over WebSocket on port 4700. Protocol derived from seestar_run source.
+Self-contained `SeestarConnection` class. **Raw TCP socket** (not WebSocket) on port 4700. JSON messages terminated by `\r\n`. No external dependencies -- Python stdlib `socket` and `json`.
 
-Commands needed:
-- Connect / disconnect
-- Goto (RA/Dec)
-- Start stacking
-- Stop stacking
-- Set LP filter position
-- Query status (slewing, stacking, idle, error)
+Key protocol details:
+- Send UDP broadcast `scan_iscope` to port 4720 before TCP connect (guest mode)
+- Messages: `{"id": <int>, "method": "<name>", "params": <obj>}\r\n`
+- Responses matched by `id` field; async events have `Event` key
+- Heartbeat required every 3-5s (`scope_get_equ_coord`)
+- Coordinates are JNow (not J2000) -- must precess from catalog ICRS
+- Wait ~3s after goto completes before starting stack
+- Wait ~2s after LP filter change for mechanical movement
 
-Blocking methods that send a command and wait for the response with a timeout. Reader thread dispatches incoming messages to waiting callers. Main loop stays synchronous.
+Commands:
+- `iscope_start_view` -- goto with plate-solving
+- `iscope_start_stack` -- begin live stacking
+- `iscope_stop_view` -- stop stacking or goto
+- `set_setting` with `stack_lenhance` -- LP filter on/off
+- `scope_get_equ_coord` -- query position / heartbeat
+- `get_view_state` -- check telescope state
 
-Uses Python stdlib where possible. May need `websockets` or `websocket-client` as a dependency.
+Reader thread dispatches incoming messages. Main loop stays synchronous via blocking methods with timeouts.
 
 ## Session Lifecycle
 
@@ -129,11 +136,12 @@ Reuse existing `send_email()`. Subject includes error summary. Body includes tar
 
 ## Dependencies
 
-- `websocket-client` or `websockets` (new -- for Seestar communication)
+- No new dependencies -- uses Python stdlib `socket` for TCP communication
 - All existing deps unchanged (astropy, tabulate, optionally skyfield)
 
 ## Implementation Notes
 
-- The WebSocket protocol details must be extracted from seestar_run source code (https://github.com/smart-underworld/seestar_run). The exact JSON message format, method names, and response structure are not publicly documented by ZWO.
+- Protocol is raw TCP with JSON + `\r\n`, NOT WebSocket. Derived from seestar_run and seestar_alp source.
 - Firmware updates may change the protocol. The command surface is small (~6 commands) so fixes should be straightforward.
 - Altitude checks in the monitor loop use astropy, not telescope telemetry. This keeps decision logic independent of telescope state and consistent with the planner's existing scoring model.
+- Catalog coordinates (ICRS/J2000) must be precessed to JNow before sending to telescope.
