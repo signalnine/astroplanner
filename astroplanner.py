@@ -45,11 +45,11 @@ ELEVATION = 30           # meters
 TIMEZONE_OFFSET = -7     # PDT (change to -8 for PST)
 TIMEZONE_NAME = "PDT"
 
-# Seestar S50 telescope connection
+# Seestar S50 telescope connection (native Alpaca API, firmware 7.x+)
 # Set SEESTAR_IP to your telescope's IP. Tip: assign a static DHCP lease
 # in your router so this never changes.
 SEESTAR_IP = "192.168.1.216"
-SEESTAR_PORT = 4700
+SEESTAR_ALPACA_PORT = 32323
 
 # LP filter auto-selection by object type
 # True = dual-band (Ha+OIII), False = UV/IR cut (clear)
@@ -664,295 +664,139 @@ def print_iss_transits(results, start_date, days, tz_offset):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Seestar S50 telescope control
+# Seestar S50 telescope control via native Alpaca API (firmware 7.x+)
 # ──────────────────────────────────────────────────────────────────────
 
 import json as _json
-import socket
-import threading
 import time as _time
 
 
-class SeestarConnection:
-    """Low-level TCP connection to a Seestar S50 telescope (port 4700).
+class SeestarTelescope:
+    """Control a Seestar S50 via its built-in Alpaca REST API (port 32323).
 
-    Protocol: JSON messages over raw TCP, terminated by \\r\\n.
-    Responses are matched by message id; async events have an 'Event' key.
+    No threading, no sockets -- just HTTP GET/PUT requests.
+    Filter wheel positions: 0=Dark, 1=IR (clear), 2=LP (dual-band).
     """
 
-    def __init__(self, ip, port=4700, timeout=10):
-        self.ip = ip
-        self.port = port
-        self.timeout = timeout
-        self._sock = None
-        self._msg_id = 1000
-        self._id_lock = threading.Lock()
-        self._write_lock = threading.Lock()
-        self._resp_lock = threading.Lock()
-        self._responses = {}   # msg_id -> {"event": Event, "result": dict}
-        self._events = []      # async events from telescope
-        self._event_lock = threading.Lock()
-        self._reader_thread = None
+    FILTER_LP = 2    # dual-band Ha+OIII
+    FILTER_CLEAR = 1 # UV/IR cut
+    FILTER_DARK = 0
+
+    def __init__(self, ip, port=32323):
+        self.base = f"http://{ip}:{port}"
+        self._txn_id = 0
         self._connected = False
-        self._recv_buf = b""
+
+    def _get(self, device, num, prop, **extra):
+        import urllib.request
+        self._txn_id += 1
+        params = f"ClientID=1&ClientTransactionID={self._txn_id}"
+        for k, v in extra.items():
+            params += f"&{k}={v}"
+        url = f"{self.base}/api/v1/{device}/{num}/{prop}?{params}"
+        resp = urllib.request.urlopen(url, timeout=10)
+        return _json.loads(resp.read().decode())
+
+    def _put(self, device, num, action, **params):
+        import urllib.request, urllib.parse
+        self._txn_id += 1
+        data = {"ClientID": 1, "ClientTransactionID": self._txn_id}
+        data.update(params)
+        body = urllib.parse.urlencode(data).encode()
+        url = f"{self.base}/api/v1/{device}/{num}/{action}"
+        req = urllib.request.Request(url, data=body, method="PUT")
+        resp = urllib.request.urlopen(req, timeout=30)
+        return _json.loads(resp.read().decode())
 
     def connect(self):
-        """Connect to the telescope. Sends UDP discovery first."""
-        # Stop any existing connection/threads first
-        if self._connected:
-            self.disconnect()
-
-        # UDP discovery broadcast (guest mode)
-        try:
-            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            udp.settimeout(2)
-            msg = _json.dumps({"id": 1, "method": "scan_iscope", "params": ""})
-            udp.sendto(msg.encode() + b"\r\n", (self.ip, 4720))
-            udp.close()
-        except Exception:
-            pass  # non-fatal -- direct TCP may still work
-
-        _time.sleep(0.5)
-
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.settimeout(self.timeout)
-        self._sock.connect((self.ip, self.port))
+        """Connect to telescope, camera, and filter wheel."""
+        self._put("telescope", 0, "connected", Connected="true")
+        self._put("camera", 0, "connected", Connected="true")
+        self._put("filterwheel", 0, "connected", Connected="true")
         self._connected = True
-        self._recv_buf = b""
-
-        # Start reader thread
-        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self._reader_thread.start()
 
     def disconnect(self):
-        """Close the connection and stop reader thread."""
-        self._connected = False
-        if self._sock:
-            try:
-                self._sock.close()
-            except Exception:
-                pass
-            self._sock = None
-        if self._reader_thread:
-            self._reader_thread.join(timeout=5)
-            self._reader_thread = None
-
-    def send(self, method, params=None, timeout=30):
-        """Send a command and wait for the response. Returns the response dict."""
-        with self._id_lock:
-            self._msg_id += 1
-            msg_id = self._msg_id
-
-        msg = {"id": msg_id, "method": method}
-        if params is not None:
-            msg["params"] = params
-
-        event = threading.Event()
-        with self._resp_lock:
-            self._responses[msg_id] = {"event": event, "result": None}
-
-        raw = _json.dumps(msg) + "\r\n"
-        with self._write_lock:
-            self._sock.sendall(raw.encode())
-
-        if event.wait(timeout):
-            with self._resp_lock:
-                resp = self._responses.pop(msg_id, {})
-            return resp.get("result")
-        else:
-            with self._resp_lock:
-                self._responses.pop(msg_id, None)
-            raise TimeoutError(f"No response to {method} (id={msg_id}) within {timeout}s")
-
-    def send_no_wait(self, method, params=None):
-        """Send a command without waiting for a response."""
-        with self._id_lock:
-            self._msg_id += 1
-            msg_id = self._msg_id
-
-        msg = {"id": msg_id, "method": method}
-        if params is not None:
-            msg["params"] = params
-
-        raw = _json.dumps(msg) + "\r\n"
-        with self._write_lock:
-            self._sock.sendall(raw.encode())
-        return msg_id
-
-    def wait_for_event(self, event_name, states=("complete", "fail"), timeout=300):
-        """Wait for an async event to reach a terminal state."""
-        deadline = _time.time() + timeout
-        while _time.time() < deadline:
-            with self._event_lock:
-                for i, ev in enumerate(self._events):
-                    if ev.get("Event") == event_name and ev.get("state") in states:
-                        self._events.pop(i)
-                        return ev
-            _time.sleep(0.5)
-        raise TimeoutError(f"Event {event_name} not received within {timeout}s")
-
-    def drain_events(self, event_name=None):
-        """Remove and return all pending events, optionally filtered by name."""
-        with self._event_lock:
-            if event_name:
-                matched = [e for e in self._events if e.get("Event") == event_name]
-                self._events = [e for e in self._events if e.get("Event") != event_name]
-            else:
-                matched = list(self._events)
-                self._events.clear()
-        return matched
-
-    @property
-    def connected(self):
-        return self._connected
-
-    def _reader_loop(self):
-        """Background thread: read TCP stream, parse JSON messages, dispatch."""
-        while self._connected:
-            try:
-                data = self._sock.recv(65536)
-                if not data:
-                    self._connected = False
-                    break
-                self._recv_buf += data
-
-                while b"\r\n" in self._recv_buf:
-                    line, self._recv_buf = self._recv_buf.split(b"\r\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        msg = _json.loads(line.decode("utf-8", errors="replace"))
-                    except (_json.JSONDecodeError, UnicodeDecodeError):
-                        continue
-
-                    # Command response (matched by id)
-                    if "id" in msg:
-                        with self._resp_lock:
-                            if msg["id"] in self._responses:
-                                entry = self._responses[msg["id"]]
-                                entry["result"] = msg
-                                entry["event"].set()
-                    # Async event
-                    if "Event" in msg:
-                        with self._event_lock:
-                            self._events.append(msg)
-
-            except socket.timeout:
-                continue
-            except OSError:
-                self._connected = False
-                break
-
-
-class SeestarTelescope:
-    """High-level Seestar S50 control: goto, stack, filter, status."""
-
-    def __init__(self, ip, port=4700):
-        self.conn = SeestarConnection(ip, port)
-        self._heartbeat_thread = None
-        self._stop_heartbeat = threading.Event()
-
-    def connect(self):
-        # Stop any existing heartbeat thread before reconnecting
-        self._stop_heartbeat.set()
-        if self._heartbeat_thread:
-            self._heartbeat_thread.join(timeout=10)
-            self._heartbeat_thread = None
-        self.conn.connect()
-        # Start heartbeat (scope_get_equ_coord every 5s)
-        self._stop_heartbeat.clear()
-        self._heartbeat_thread = threading.Thread(target=self._heartbeat, daemon=True)
-        self._heartbeat_thread.start()
-
-    def disconnect(self):
-        self._stop_heartbeat.set()
-        if self._heartbeat_thread:
-            self._heartbeat_thread.join(timeout=10)
-            self._heartbeat_thread = None
+        """Disconnect all devices."""
         try:
-            self.conn.send("iscope_stop_view", timeout=5)
+            self._put("camera", 0, "connected", Connected="false")
         except Exception:
             pass
-        self.conn.disconnect()
+        try:
+            self._put("filterwheel", 0, "connected", Connected="false")
+        except Exception:
+            pass
+        try:
+            self._put("telescope", 0, "connected", Connected="false")
+        except Exception:
+            pass
+        self._connected = False
 
     def goto(self, ra_j2000_hours, dec_j2000_deg, target_name, lp_filter=False):
         """
-        Slew to target with plate-solving.
-        RA/Dec are J2000; converted to JNow internally.
+        Slew to target. Alpaca SlewToCoordinatesAsync uses J2000 topocentric.
         Returns True on success, False on failure.
         """
-        from astropy.coordinates import FK5
-        from astropy.time import Time as AstroTime
-        coord = SkyCoord(ra=ra_j2000_hours * u.hourangle, dec=dec_j2000_deg * u.deg,
-                         frame="icrs")
-        now = AstroTime.now()
-        jnow = coord.transform_to(FK5(equinox=now))
-        ra_jnow = jnow.ra.hour
-        dec_jnow = jnow.dec.deg
+        self._put("telescope", 0, "tracking", Tracking="true")
+        resp = self._put("telescope", 0, "slewtocoordinatesasync",
+                         RightAscension=ra_j2000_hours,
+                         Declination=dec_j2000_deg)
+        if resp.get("ErrorNumber", 0) != 0:
+            return False
 
-        # Drain any old AutoGoto events
-        self.conn.drain_events("AutoGoto")
-
-        self.conn.send("iscope_start_view", {
-            "mode": "star",
-            "target_ra_dec": [ra_jnow, dec_jnow],
-            "target_name": target_name,
-            "lp_filter": lp_filter,
-        }, timeout=10)
-
-        # Wait for goto to complete (up to 5 minutes)
-        ev = self.conn.wait_for_event("AutoGoto", timeout=300)
-        if ev.get("state") == "complete":
-            _time.sleep(3)  # settling time before stacking
-            return True
+        # Wait for slew to complete (up to 5 minutes)
+        for _ in range(300):
+            _time.sleep(1)
+            state = self._get("telescope", 0, "slewing")
+            if not state.get("Value", False):
+                return True
         return False
 
     def start_stacking(self):
-        """Start live stacking. Returns True on success."""
-        resp = self.conn.send("iscope_start_stack", {"restart": True}, timeout=10)
-        return resp is not None and resp.get("code", -1) == 0
+        """Start camera exposure (live stacking). Returns True on success."""
+        try:
+            resp = self._put("camera", 0, "startexposure",
+                             Duration=10.0, Light="true")
+            return resp.get("ErrorNumber", 0) == 0
+        except Exception:
+            return False
 
     def stop_stacking(self):
-        """Stop current stacking session."""
+        """Stop/abort current exposure."""
         try:
-            self.conn.send("iscope_stop_view", {"stage": "Stack"}, timeout=10)
+            self._put("camera", 0, "abortexposure")
         except Exception:
             pass
 
     def set_lp_filter(self, enabled):
-        """Set LP filter. True = dual-band ON, False = clear/UV-IR cut."""
-        self.conn.send("set_setting", {"stack_lenhance": enabled}, timeout=10)
+        """Set LP filter. True = dual-band, False = clear/UV-IR cut."""
+        position = self.FILTER_LP if enabled else self.FILTER_CLEAR
+        self._put("filterwheel", 0, "position", Position=position)
         _time.sleep(2)  # wait for filter wheel
 
     def get_position(self):
-        """Get current RA/Dec (JNow). Returns (ra_hours, dec_deg) or None."""
-        resp = self.conn.send("scope_get_equ_coord", timeout=5)
-        if resp and "result" in resp:
-            return resp["result"].get("ra"), resp["result"].get("dec")
-        return None
-
-    def get_view_state(self):
-        """Query telescope view state. Returns response dict or None."""
+        """Get current RA/Dec. Returns (ra_hours, dec_deg) or None."""
         try:
-            resp = self.conn.send("get_view_state", timeout=5)
-            return resp
+            ra = self._get("telescope", 0, "rightascension")["Value"]
+            dec = self._get("telescope", 0, "declination")["Value"]
+            return ra, dec
         except Exception:
             return None
 
-    def is_connected(self):
-        return self.conn.connected
+    def is_slewing(self):
+        try:
+            return self._get("telescope", 0, "slewing")["Value"]
+        except Exception:
+            return False
 
-    def _heartbeat(self):
-        """Send heartbeat every 5 seconds to keep connection alive."""
-        while not self._stop_heartbeat.wait(5):
-            if not self.conn.connected:
-                break
-            try:
-                self.conn.send_no_wait("scope_get_equ_coord")
-            except Exception:
-                break
+    def is_connected(self):
+        if not self._connected:
+            return False
+        try:
+            resp = self._get("telescope", 0, "connected")
+            return resp.get("Value", False)
+        except Exception:
+            self._connected = False
+            return False
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1015,8 +859,8 @@ def run_observe(location, start_date, min_alt, min_moon_sep, type_filter, lp_fil
                 ", ".join(f"{r['name']}({r['adjusted_score']:.0f})" for r in candidates[:5]))
 
     # 2. Connect to telescope
-    observe_log(f"Connecting to Seestar at {SEESTAR_IP}:{SEESTAR_PORT}...")
-    scope = SeestarTelescope(SEESTAR_IP, SEESTAR_PORT)
+    observe_log(f"Connecting to Seestar at {SEESTAR_IP}:{SEESTAR_ALPACA_PORT} (Alpaca)...")
+    scope = SeestarTelescope(SEESTAR_IP, SEESTAR_ALPACA_PORT)
     try:
         scope.connect()
     except Exception as e:
@@ -1158,25 +1002,9 @@ def _observe_target(scope, target, location, dark_end, min_alt, lp_filter_mode, 
             session_log.append((name, start_time, datetime.now(timezone.utc), "target_set"))
             return "target_set"
 
-        # Check if stacking is still active
-        if scope.is_connected():
-            view_state = scope.get_view_state()
-            if view_state and view_state.get("result"):
-                state_info = view_state["result"]
-                # If telescope reports it's no longer stacking, restart
-                stage = state_info.get("stage", "")
-                if isinstance(stage, str) and stage and "Stack" not in stage:
-                    observe_log(f"Stacking appears to have stopped (stage={stage}). Restarting...")
-                    if not scope.start_stacking():
-                        observe_log("Failed to restart stacking.")
-                        session_log.append((name, start_time, datetime.now(timezone.utc),
-                                            "stack_failed"))
-                        return "target_set"
-                    observe_log("Stacking restarted.")
-
-        # Check connection
+        # Check connection (Alpaca is HTTP -- just test with a GET)
         if not scope.is_connected():
-            observe_log("Connection lost. Attempting reconnect...")
+            observe_log("Connection to telescope lost. Attempting reconnect...")
             reconnected = False
             for i in range(5):
                 delay = backoff_delays[min(i, len(backoff_delays) - 1)]
@@ -1187,19 +1015,8 @@ def _observe_target(scope, target, location, dark_end, min_alt, lp_filter_mode, 
                     pos = scope.get_position()
                     if pos:
                         observe_log(f"Reconnected. Position: RA={pos[0]:.4f} Dec={pos[1]:.4f}")
-                        # Check if still on-target (TCP drop may not stop telescope)
-                        ra_diff = abs(pos[0] - ra_hours) * 15  # rough arcmin
-                        dec_diff = abs(pos[1] - dec_deg) * 60
-                        if ra_diff < 5 and dec_diff < 5:
-                            observe_log("Telescope still on target. Resuming monitor.")
-                            reconnected = True
-                            break
-                        observe_log(f"Off target. Re-acquiring {name}...")
-                        if scope.goto(ra_hours, dec_deg, name, lp_filter=use_lp):
-                            if scope.start_stacking():
-                                observe_log("Stacking resumed.")
-                                reconnected = True
-                                break
+                        reconnected = True
+                        break
                 except Exception as e:
                     observe_log(f"Reconnect attempt failed: {e}")
 
