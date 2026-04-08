@@ -918,7 +918,13 @@ def run_observe(location, start_date, min_alt, min_moon_sep, type_filter, lp_fil
                 break
             target_idx += 1
     finally:
-        observe_log("Stopping telescope...")
+        observe_log("Parking telescope...")
+        try:
+            scope.stop_stacking()
+            scope._put("telescope", 0, "park")
+            observe_log("Telescope parked (arm stowed).")
+        except Exception as e:
+            observe_log(f"Warning: Park failed -- {e}")
         scope.disconnect()
         _print_session_summary(session_log)
 
