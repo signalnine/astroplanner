@@ -1020,7 +1020,7 @@ def _observe_target(scope, target, location, dark_end, min_alt, lp_filter_mode, 
         _time.sleep(60)
 
         # Check dark window
-        now_utc = Time(datetime.now(timezone.utc).isoformat(), scale="utc")
+        now_utc = Time(datetime.now(timezone.utc))
         if now_utc >= dark_end:
             elapsed = (_time.time() - stack_start) / 3600
             observe_log(f"Dark window ended. Stacked {name} for {elapsed:.1f}h")
