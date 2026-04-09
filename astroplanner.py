@@ -669,6 +669,7 @@ def print_iss_transits(results, start_date, days, tz_offset):
 
 import json as _json
 import time as _time
+import os
 
 
 class SeestarTelescope:
@@ -751,17 +752,41 @@ class SeestarTelescope:
                 return True
         return False
 
-    def start_stacking(self):
-        """Start camera exposure (live stacking). Returns True on success."""
-        try:
-            resp = self._put("camera", 0, "startexposure",
-                             Duration=10.0, Light="true")
-            return resp.get("ErrorNumber", 0) == 0
-        except Exception:
+    def expose(self, duration=10.0):
+        """Start an exposure and wait for it to complete. Returns True on success."""
+        resp = self._put("camera", 0, "startexposure",
+                         Duration=duration, Light=True)
+        if resp.get("ErrorNumber", 0) != 0:
             return False
+        deadline = _time.time() + duration + 30
+        while _time.time() < deadline:
+            _time.sleep(1)
+            try:
+                ready = self._get("camera", 0, "imageready")
+                if ready.get("Value", False):
+                    return True
+            except Exception:
+                pass
+        return False
 
-    def stop_stacking(self):
-        """Stop/abort current exposure."""
+    def download_image(self):
+        """Download the last exposed image as a numpy array. Returns (array, error_str)."""
+        import urllib.request
+        import numpy as np
+        try:
+            self._txn_id += 1
+            url = f"{self.base}/api/v1/camera/0/imagearray?ClientID=1&ClientTransactionID={self._txn_id}"
+            resp = urllib.request.urlopen(url, timeout=60)
+            data = _json.loads(resp.read().decode())
+            if data.get("ErrorNumber", 0) != 0:
+                return None, data.get("ErrorMessage", "unknown error")
+            arr = np.array(data["Value"], dtype=np.uint16)
+            return arr, None
+        except Exception as e:
+            return None, str(e)
+
+    def abort_exposure(self):
+        """Abort current exposure."""
         try:
             self._put("camera", 0, "abortexposure")
         except Exception:
@@ -839,12 +864,14 @@ def select_observe_targets(location, start_date, min_alt, min_moon_sep, type_fil
 
 
 def run_observe(location, start_date, min_alt, min_moon_sep, type_filter,
-                lp_filter_mode, target_name=None):
+                lp_filter_mode, target_name=None, exposure_time=10.0):
     """
     Automated observe session: connect to Seestar, pick best target,
     image it for as long as possible with one fallback.
     """
     observe_log("Starting observe session")
+    if exposure_time < 1 or exposure_time > 30:
+        observe_log(f"WARNING: Exposure {exposure_time}s is outside recommended 1-30s range")
 
     # 1. Select targets
     candidates, dark_start, dark_end = select_observe_targets(
@@ -915,7 +942,7 @@ def run_observe(location, start_date, min_alt, min_moon_sep, type_filter,
         while target_idx < len(candidates) and (not fallback_used or target_idx <= 1):
             target = candidates[target_idx]
             result = _observe_target(scope, target, location, dark_end, min_alt,
-                                     lp_filter_mode, session_log)
+                                     lp_filter_mode, session_log, exposure_time)
             if result == "done":
                 break
             elif result == "target_set":
@@ -942,7 +969,7 @@ def run_observe(location, start_date, min_alt, min_moon_sep, type_filter,
     finally:
         observe_log("Parking telescope...")
         try:
-            scope.stop_stacking()
+            scope.abort_exposure()
             scope._put("telescope", 0, "park")
             observe_log("Telescope parked (arm stowed).")
         except Exception as e:
@@ -951,9 +978,12 @@ def run_observe(location, start_date, min_alt, min_moon_sep, type_filter,
         _print_session_summary(session_log)
 
 
-def _observe_target(scope, target, location, dark_end, min_alt, lp_filter_mode, session_log):
+def _observe_target(scope, target, location, dark_end, min_alt, lp_filter_mode,
+                    session_log, exposure_time=10.0):
     """
-    Observe a single target. Returns:
+    Observe a single target by taking continuous sub-frame exposures.
+    Saves each frame as FITS, updates preview every 50 frames.
+    Returns:
       "done" -- dark window ended
       "target_set" -- target below min altitude
       "error" -- unrecoverable error
@@ -970,8 +1000,8 @@ def _observe_target(scope, target, location, dark_end, min_alt, lp_filter_mode, 
     else:
         use_lp = LP_FILTER_AUTO.get(obj_type, False)
 
-    lp_str = "ON" if use_lp else "OFF"
-    observe_log(f"Target: {name} ({common}) -- {obj_type}, LP filter {lp_str}")
+    filter_name = "LP" if use_lp else "IR"
+    observe_log(f"Target: {name} ({common}) -- {obj_type}, filter {filter_name}")
     observe_log(f"Window: until {utc_to_local(target['window_end'], TIMEZONE_OFFSET)} "
                 f"{TIMEZONE_NAME} ({target['remaining_hours']:.1f}h remaining)")
 
@@ -982,7 +1012,17 @@ def _observe_target(scope, target, location, dark_end, min_alt, lp_filter_mode, 
         observe_log(f"Warning: LP filter set failed -- {e}")
 
     # Get J2000 RA/Dec from catalog
-    cat_entry = next(c for c in DSO_CATALOG if c[0] == name)
+    cat_entry = None
+    for c in DSO_CATALOG:
+        if c[0] == name:
+            cat_entry = c
+            break
+    if cat_entry is None:
+        observe_log(f"ERROR: {name} not found in catalog")
+        session_log.append((name, datetime.now(timezone.utc), datetime.now(timezone.utc),
+                            "catalog_error", 0))
+        return "target_set"
+
     coord = SkyCoord(ra=cat_entry[2], dec=cat_entry[3])
     ra_hours = coord.ra.hour
     dec_deg = coord.dec.deg
@@ -1004,80 +1044,193 @@ def _observe_target(scope, target, location, dark_end, min_alt, lp_filter_mode, 
 
     if not goto_success:
         observe_log(f"FAILED: Could not slew to {name}")
-        session_log.append((name, start_time, datetime.now(timezone.utc), "goto_failed"))
-        return "target_set"  # try fallback
-
-    # Start stacking
-    observe_log(f"Starting stacking on {name}...")
-    if not scope.start_stacking():
-        observe_log(f"FAILED: Could not start stacking on {name}")
-        session_log.append((name, start_time, datetime.now(timezone.utc), "stack_failed"))
+        session_log.append((name, start_time, datetime.now(timezone.utc), "goto_failed", 0))
         return "target_set"
 
-    observe_log(f"Stacking {name}. Monitoring...")
+    # Create output directory
+    date_str = start_time.strftime("%Y-%m-%d")
+    safe_name = "".join(c for c in name if c.isalnum() or c in "-_")
+    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "captures", f"{date_str}_{safe_name}")
+    os.makedirs(output_dir, exist_ok=True)
+    preview_path = os.path.join(output_dir, "preview.png")
 
-    # Monitor loop
+    # Check disk space (need at least 1GB free)
+    try:
+        stat = os.statvfs(output_dir)
+        free_gb = (stat.f_bavail * stat.f_frsize) / (1024 ** 3)
+        if free_gb < 1.0:
+            observe_log(f"WARNING: Only {free_gb:.1f}GB free disk space")
+    except Exception:
+        pass
+
+    observe_log(f"Saving sub-frames to {output_dir}")
+    observe_log(f"Starting {exposure_time}s exposures on {name}...")
+
+    # Exposure loop
+    frame_num = 0
+    running_sum = None
     last_status_log = _time.time()
-    stack_start = _time.time()
-    backoff_delays = [10, 20, 40, 80, 160]
+    consecutive_expose_failures = 0
+    consecutive_download_failures = 0
 
     while True:
-        _time.sleep(60)
-
         # Check dark window
         now_utc = Time(datetime.now(timezone.utc))
         if now_utc >= dark_end:
-            elapsed = (_time.time() - stack_start) / 3600
-            observe_log(f"Dark window ended. Stacked {name} for {elapsed:.1f}h")
-            scope.stop_stacking()
-            session_log.append((name, start_time, datetime.now(timezone.utc), "complete"))
+            observe_log(f"Dark window ended. Captured {frame_num} frames of {name}")
+            session_log.append((name, start_time, datetime.now(timezone.utc),
+                                "complete", frame_num))
             return "done"
 
-        # Check target altitude
-        altaz_frame = AltAz(obstime=now_utc, location=location)
-        target_coord = SkyCoord(ra=ra_hours * u.hourangle, dec=dec_deg * u.deg)
-        alt = target_coord.transform_to(altaz_frame).alt.deg
-        if alt < min_alt:
-            elapsed = (_time.time() - stack_start) / 3600
-            observe_log(f"{name} below {min_alt}deg (alt={alt:.1f}deg). "
-                        f"Stacked for {elapsed:.1f}h")
-            scope.stop_stacking()
-            session_log.append((name, start_time, datetime.now(timezone.utc), "target_set"))
-            return "target_set"
-
-        # Check connection (Alpaca is HTTP -- just test with a GET)
-        if not scope.is_connected():
-            observe_log("Connection to telescope lost. Attempting reconnect...")
-            reconnected = False
-            for i in range(5):
-                delay = backoff_delays[min(i, len(backoff_delays) - 1)]
-                observe_log(f"Retry {i + 1}/5 in {delay}s...")
-                _time.sleep(delay)
-                try:
-                    scope.connect()
-                    pos = scope.get_position()
-                    if pos:
-                        observe_log(f"Reconnected. Position: RA={pos[0]:.4f} Dec={pos[1]:.4f}")
-                        reconnected = True
-                        break
-                except Exception as e:
-                    observe_log(f"Reconnect attempt failed: {e}")
-
-            if not reconnected:
-                observe_log("FATAL: Could not reconnect after 5 attempts.")
+        # Check target altitude (every 10 frames to avoid overhead)
+        if frame_num % 10 == 0 and frame_num > 0:
+            altaz_frame = AltAz(obstime=now_utc, location=location)
+            target_coord = SkyCoord(ra=ra_hours * u.hourangle, dec=dec_deg * u.deg)
+            alt = target_coord.transform_to(altaz_frame).alt.deg
+            if alt < min_alt:
+                observe_log(f"{name} below {min_alt}deg (alt={alt:.1f}deg). "
+                            f"Captured {frame_num} frames")
                 session_log.append((name, start_time, datetime.now(timezone.utc),
-                                    "connection_lost"))
-                _send_observe_email(
-                    "Connection lost",
-                    f"Lost connection while imaging {name}. 5 reconnect attempts failed.",
+                                    "target_set", frame_num))
+                return "target_set"
+
+        # Check disk space periodically (every 100 frames)
+        if frame_num > 0 and frame_num % 100 == 0:
+            try:
+                stat = os.statvfs(output_dir)
+                free_gb = (stat.f_bavail * stat.f_frsize) / (1024 ** 3)
+                if free_gb < 0.5:
+                    observe_log(f"Disk space critically low ({free_gb:.1f}GB). Stopping.")
+                    session_log.append((name, start_time, datetime.now(timezone.utc),
+                                        "disk_full", frame_num))
+                    return "error"
+            except Exception:
+                pass
+
+        # Take exposure
+        if not scope.expose(exposure_time):
+            consecutive_expose_failures += 1
+            observe_log(f"Exposure failed (attempt {consecutive_expose_failures})")
+            if consecutive_expose_failures >= 5:
+                observe_log(f"FATAL: 5 consecutive exposure failures on {name}")
+                session_log.append((name, start_time, datetime.now(timezone.utc),
+                                    "exposure_failed", frame_num))
+                _send_observe_email("Exposure failed",
+                    f"5 consecutive exposure failures on {name} after {frame_num} frames.",
                     session_log)
                 return "error"
+            _time.sleep(5)
+            continue
+
+        consecutive_expose_failures = 0
+
+        # Download image
+        image, err = scope.download_image()
+        if image is None:
+            consecutive_download_failures += 1
+            observe_log(f"Download failed ({consecutive_download_failures}): {err}")
+            if consecutive_download_failures >= 5:
+                observe_log(f"FATAL: 5 consecutive download failures on {name}")
+                session_log.append((name, start_time, datetime.now(timezone.utc),
+                                    "download_failed", frame_num))
+                _send_observe_email("Download failed",
+                    f"5 consecutive download failures on {name} after {frame_num} frames.",
+                    session_log)
+                return "error"
+            continue
+
+        consecutive_download_failures = 0
+        frame_num += 1
+        timestamp = datetime.now(timezone.utc)
+
+        # Save FITS
+        _save_fits(image, output_dir, name, frame_num, ra_hours, dec_deg,
+                   exposure_time, filter_name, timestamp)
+
+        # Update running sum for preview (always accumulate)
+        import numpy as np
+        if running_sum is None:
+            running_sum = image.astype(np.float64)
+        else:
+            running_sum += image.astype(np.float64)
+
+        # Update preview PNG every 50 frames (or on first frame)
+        if frame_num % 50 == 0 or frame_num == 1:
+            mean = running_sum / frame_num
+            stretched = np.log1p(mean - mean.min())
+            max_val = stretched.max()
+            if max_val > 0:
+                stretched = (stretched / max_val * 255).astype(np.uint8)
+            else:
+                stretched = np.zeros_like(mean, dtype=np.uint8)
+            from PIL import Image
+            img = Image.fromarray(stretched)
+            tmp = preview_path + ".tmp"
+            img.save(tmp)
+            os.replace(tmp, preview_path)
+            observe_log(f"Frame {frame_num} saved. Preview updated.")
 
         # Periodic status log (every 10 min)
         if _time.time() - last_status_log >= 600:
-            elapsed = (_time.time() - stack_start) / 60
-            observe_log(f"Stacking {name}: {elapsed:.0f} min elapsed, alt={alt:.1f}deg")
+            elapsed_min = (datetime.now(timezone.utc) - start_time).total_seconds() / 60
+            observe_log(f"Imaging {name}: {frame_num} frames, {elapsed_min:.0f} min elapsed")
             last_status_log = _time.time()
+
+
+def _save_fits(image_array, output_dir, target_name, frame_num, ra_hours, dec_deg,
+               exposure_time, filter_name, timestamp_utc):
+    """Save a single sub-frame as a FITS file with metadata headers."""
+    from astropy.io import fits
+    import numpy as np
+
+    hdu = fits.PrimaryHDU(image_array.astype(np.uint16))
+    h = hdu.header
+    h["OBJECT"] = target_name
+    h["RA"] = ra_hours * 15.0
+    h["DEC"] = dec_deg
+    h["DATE-OBS"] = timestamp_utc.strftime("%Y-%m-%dT%H:%M:%S")
+    h["EXPTIME"] = exposure_time
+    h["FILTER"] = filter_name
+    h["FRAME"] = frame_num
+    h["INSTRUME"] = "Seestar S50"
+    h["TELESCOP"] = "ZWO Seestar S50"
+    h["FOCALLEN"] = 463
+    h["APERTURE"] = 50
+    h["SITELAT"] = LATITUDE
+    h["SITELONG"] = LONGITUDE
+
+    fname = os.path.join(output_dir, f"{target_name}_{frame_num:04d}.fits")
+    # Write to temp file then rename to avoid partial writes
+    tmp = fname + ".tmp"
+    hdu.writeto(tmp, overwrite=True)
+    os.replace(tmp, fname)
+    return fname
+
+
+def _update_preview(image_array, preview_path, frame_count, running_sum):
+    """Update running mean preview PNG. Returns updated running_sum."""
+    import numpy as np
+
+    if running_sum is None:
+        running_sum = image_array.astype(np.float64)
+    else:
+        running_sum += image_array.astype(np.float64)
+
+    mean = running_sum / frame_count
+    stretched = np.log1p(mean - mean.min())
+    max_val = stretched.max()
+    if max_val > 0:
+        stretched = (stretched / max_val * 255).astype(np.uint8)
+    else:
+        stretched = np.zeros_like(mean, dtype=np.uint8)
+
+    from PIL import Image
+    img = Image.fromarray(stretched)
+    tmp = preview_path + ".tmp"
+    img.save(tmp)
+    os.replace(tmp, preview_path)
+    return running_sum
 
 
 def _send_observe_email(subject_detail, body_detail, session_log):
@@ -1085,9 +1238,11 @@ def _send_observe_email(subject_detail, body_detail, session_log):
     lines = [f"Observe session: {subject_detail}", "", body_detail, ""]
     if session_log:
         lines.append("Session log:")
-        for name, start, end, status in session_log:
+        for entry in session_log:
+            name, start, end, status = entry[0], entry[1], entry[2], entry[3]
+            frames = entry[4] if len(entry) > 4 else 0
             duration = (end - start).total_seconds() / 3600
-            lines.append(f"  {name}: {duration:.1f}h -- {status}")
+            lines.append(f"  {name}: {duration:.1f}h, {frames} frames -- {status}")
     body = "\n".join(lines)
     subject = f"Seestar: {subject_detail}"
     if not send_email(subject, body):
@@ -1103,23 +1258,31 @@ def _print_session_summary(session_log):
     observe_log("=" * 60)
     observe_log("SESSION SUMMARY")
     total_hours = 0
-    for name, start, end, status in session_log:
+    total_frames = 0
+    for entry in session_log:
+        name, start, end, status = entry[0], entry[1], entry[2], entry[3]
+        frames = entry[4] if len(entry) > 4 else 0
         duration = (end - start).total_seconds() / 3600
         total_hours += duration
+        total_frames += frames
         status_str = {"complete": "ok", "target_set": "target set",
-                      "goto_failed": "goto failed", "stack_failed": "stack failed",
-                      "connection_lost": "connection lost"}.get(status, status)
-        observe_log(f"  {name}: {duration:.1f}h -- {status_str}")
-    observe_log(f"Total imaging time: {total_hours:.1f}h")
+                      "goto_failed": "goto failed", "exposure_failed": "exposure failed",
+                      "download_failed": "download failed", "disk_full": "disk full",
+                      "connection_lost": "connection lost",
+                      "catalog_error": "catalog error"}.get(status, status)
+        observe_log(f"  {name}: {duration:.1f}h, {frames} frames -- {status_str}")
+    observe_log(f"Total imaging time: {total_hours:.1f}h, {total_frames} frames")
     observe_log("=" * 60)
 
     # Email summary
     lines = ["Seestar observe session complete.", ""]
-    for name, start, end, status in session_log:
+    for entry in session_log:
+        name, start, end, status = entry[0], entry[1], entry[2], entry[3]
+        frames = entry[4] if len(entry) > 4 else 0
         duration = (end - start).total_seconds() / 3600
-        lines.append(f"{name}: {duration:.1f}h ({status})")
-    lines.append(f"\nTotal: {total_hours:.1f}h")
-    send_email(f"Seestar: session complete -- {total_hours:.1f}h imaging", "\n".join(lines))
+        lines.append(f"{name}: {duration:.1f}h, {frames} frames ({status})")
+    lines.append(f"\nTotal: {total_hours:.1f}h, {total_frames} frames")
+    send_email(f"Seestar: session complete -- {total_hours:.1f}h, {total_frames} frames", "\n".join(lines))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1933,6 +2096,10 @@ def main():
         "--target", type=str, default=None,
         help="Specific target for --observe, e.g. --target M94 (default: auto-pick best)"
     )
+    parser.add_argument(
+        "--exposure", type=float, default=10.0,
+        help="Exposure time per sub-frame in seconds for --observe (default: 10.0)"
+    )
     args = parser.parse_args()
 
     location = EarthLocation(
@@ -1971,7 +2138,7 @@ def main():
             print("Error: Set SEESTAR_IP in astroplanner.py config section.")
             sys.exit(1)
         run_observe(location, start_date, args.min_alt, args.min_moon_sep,
-                    args.type, args.lp_filter, args.target)
+                    args.type, args.lp_filter, args.target, args.exposure)
         return
 
     if args.week:
@@ -2132,12 +2299,14 @@ def main():
         print(f"  AUTOMATED OBSERVING")
         print(f"  {'─' * 74}")
         print(f"  To image tonight's top target automatically:")
-        print(f"    1. Power on the Seestar and let it connect to WiFi")
-        print(f"    2. Open the phone app, open the arm, then close the app")
-        print(f"    3. Run: python astroplanner.py --observe")
+        print(f"    1. In Seestar app: Settings > Auto Power Off > Never (first time only)")
+        print(f"    2. Power on the Seestar and let it connect to WiFi")
+        print(f"    3. Open the phone app, open the arm, then close the app")
+        print(f"    4. Run: python astroplanner.py --observe")
         print(f"")
         print(f"  The telescope will slew to {top['name']} ({top['common']}),")
-        print(f"  set the {lp_str} filter, and stack for {top['hours_above']:.1f}h.")
+        print(f"  set the {lp_str} filter, and capture 10s sub-frames")
+        print(f"  for {top['hours_above']:.1f}h. Stack the FITS files in Siril/DSS.")
         print(f"  At dawn it will park the telescope and email a summary.")
         print(f"{'=' * 78}")
 
