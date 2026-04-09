@@ -838,7 +838,8 @@ def select_observe_targets(location, start_date, min_alt, min_moon_sep, type_fil
     return filtered, dark_start, dark_end
 
 
-def run_observe(location, start_date, min_alt, min_moon_sep, type_filter, lp_filter_mode):
+def run_observe(location, start_date, min_alt, min_moon_sep, type_filter,
+                lp_filter_mode, target_name=None):
     """
     Automated observe session: connect to Seestar, pick best target,
     image it for as long as possible with one fallback.
@@ -852,6 +853,22 @@ def run_observe(location, start_date, min_alt, min_moon_sep, type_filter, lp_fil
     if not candidates:
         observe_log("No observable targets tonight.")
         return
+
+    # If a specific target was requested, move it to the front
+    if target_name:
+        target_name_upper = target_name.upper()
+        match = [r for r in candidates if r["name"].upper() == target_name_upper]
+        if not match:
+            # Try matching common name
+            match = [r for r in candidates
+                     if target_name.lower() in r["common"].lower()]
+        if match:
+            others = [r for r in candidates if r is not match[0]]
+            candidates = [match[0]] + others
+            observe_log(f"Target override: {match[0]['name']} ({match[0]['common']})")
+        else:
+            observe_log(f"WARNING: Target '{target_name}' not found or not observable tonight.")
+            observe_log("Falling back to auto-pick.")
 
     observe_log(f"Dark window: {utc_to_local(dark_start, TIMEZONE_OFFSET)}-"
                 f"{utc_to_local(dark_end, TIMEZONE_OFFSET)} {TIMEZONE_NAME}")
@@ -1907,6 +1924,10 @@ def main():
         choices=["on", "off", "auto"],
         help="LP filter mode for --observe (default: auto, selects by object type)"
     )
+    parser.add_argument(
+        "--target", type=str, default=None,
+        help="Specific target for --observe, e.g. --target M94 (default: auto-pick best)"
+    )
     args = parser.parse_args()
 
     location = EarthLocation(
@@ -1945,7 +1966,7 @@ def main():
             print("Error: Set SEESTAR_IP in astroplanner.py config section.")
             sys.exit(1)
         run_observe(location, start_date, args.min_alt, args.min_moon_sep,
-                    args.type, args.lp_filter)
+                    args.type, args.lp_filter, args.target)
         return
 
     if args.week:
