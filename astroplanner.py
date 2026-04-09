@@ -888,17 +888,22 @@ def run_observe(location, start_date, min_alt, min_moon_sep, type_filter,
 
     observe_log("Connected to Seestar S50")
 
-    # Check if arm is open (atpark=True or tracking fails means arm is closed)
+    # Clear parked state if needed (arm may be physically open but flag is sticky)
     try:
         at_park = scope._get("telescope", 0, "atpark")["Value"]
         if at_park:
-            observe_log("FATAL: Telescope arm is closed (parked).")
-            observe_log("Open the arm from the Seestar phone app, then disconnect the app.")
-            _send_observe_email("Arm closed",
-                "Telescope arm is parked. Open it from the phone app before running --observe.",
-                [])
-            scope.disconnect()
-            return
+            observe_log("Telescope reports parked. Sending unpark...")
+            scope._put("telescope", 0, "unpark")
+            at_park = scope._get("telescope", 0, "atpark")["Value"]
+            if at_park:
+                observe_log("FATAL: Telescope arm is closed (parked).")
+                observe_log("Open the arm from the Seestar phone app, then disconnect the app.")
+                _send_observe_email("Arm closed",
+                    "Telescope arm is parked. Open it from the phone app before running --observe.",
+                    [])
+                scope.disconnect()
+                return
+            observe_log("Unparked.")
     except Exception:
         pass  # if we can't check, proceed and let the slew fail with a clear error
 
