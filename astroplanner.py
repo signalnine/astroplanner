@@ -94,6 +94,35 @@ DSO_CATALOG = [
     ("NGC2264","Cone + Christmas Tree",  "06h41m06.0s", "+09d53m00s", "emission",   3.9,  20, 3, "cluster + nebulosity"),
     ("M97",    "Owl Nebula",             "11h14m47.7s", "+55d01m09s", "planetary",  9.9,   3, 3, "face-on planetary, fun target"),
 
+    # Additional emission nebulae (LP filter targets, Bortle-friendly)
+    ("IC1805", "Heart Nebula",           "02h32m42.0s", "+61d27m00s", "emission",   6.5, 150, 3, "huge Ha target, dual-band essential"),
+    ("IC1848", "Soul Nebula",            "02h55m24.0s", "+60d24m36s", "emission",   6.5, 100, 3, "companion to Heart, both fit Seestar FOV"),
+    ("NGC7635","Bubble Nebula",          "23h20m48.0s", "+61d12m00s", "emission",   7.0,  15, 3, "tiny bubble, dual-band reveals it"),
+    ("IC410",  "Tadpoles Nebula",        "05h22m36.0s", "+33d31m00s", "emission",   7.5,  40, 3, "Auriga Ha region with embedded cluster"),
+    ("IC405",  "Flaming Star Nebula",    "05h16m12.0s", "+34d16m00s", "emission",   6.0,  30, 3, "mix of emission + reflection"),
+    ("IC443",  "Jellyfish Nebula",       "06h17m13.0s", "+22d31m05s", "SNR",        7.5,  50, 4, "supernova remnant, dual-band critical"),
+    ("NGC1499","California Nebula",      "04h03m18.0s", "+36d25m18s", "emission",   5.0, 145, 3, "huge, only fits in mosaic, LP target"),
+    ("NGC7380","Wizard Nebula",          "22h47m21.0s", "+58d07m54s", "emission",   7.2,  25, 3, "Cepheus Ha region with cluster"),
+    ("NGC2174","Monkey Head Nebula",     "06h09m24.0s", "+20d29m24s", "emission",   6.8,  40, 3, "Orion border, dual-band reveals shape"),
+    ("NGC7822","Cepheus Ha Region",      "00h03m36.0s", "+68d37m00s", "emission",   8.0, 100, 4, "huge Ha complex, needs lots of stacking"),
+    ("Sh2-101","Tulip Nebula",           "20h00m36.0s", "+35d18m00s", "emission",   9.0,  16, 4, "in Cygnus, near Cyg X-1, dual-band"),
+    ("Sh2-155","Cave Nebula",            "22h57m54.0s", "+62d31m00s", "emission",   7.7,  30, 4, "faint emission/reflection mix in Cepheus"),
+    ("NGC6820","Sulfur Nebula near M27", "19h42m54.0s", "+23d05m18s", "emission",   8.5,  40, 4, "faint emission near Dumbbell"),
+    ("NGC6995","Network/Veil East",      "20h57m00.0s", "+31d13m00s", "SNR",        7.0,  60, 2, "another Veil component, LP essential"),
+
+    # Additional planetary nebulae
+    ("NGC6543","Cat's Eye Planetary",    "17h58m33.4s", "+66d37m59s", "planetary",  8.1,   0.3, 4, "tiny but high surface brightness"),
+    ("NGC2392","Eskimo Nebula",          "07h29m10.8s", "+20d54m42s", "planetary",  9.1,   0.7, 4, "small but bright, classic planetary"),
+    ("NGC6826","Blinking Planetary",     "19h44m48.2s", "+50d31m31s", "planetary",  8.8,   0.5, 4, "tiny, named for averted-vision effect"),
+    ("NGC7293","Helix Nebula",           "22h29m38.5s", "-20d50m14s", "planetary",  7.3,  25, 3, "huge planetary, low altitude from 37N"),
+    ("NGC40",  "Bow-tie Nebula",         "00h13m01.0s", "+72d31m19s", "planetary", 10.7,   1, 4, "small Cepheus planetary"),
+    ("NGC6781","Snowglobe Nebula",       "19h18m28.1s", "+06d32m19s", "planetary", 11.4,   2, 4, "circular planetary in Aquila"),
+
+    # Additional reflection nebulae (don't benefit from LP filter, but bright)
+    ("NGC7023","Iris Nebula",            "21h00m31.0s", "+68d10m00s", "reflection", 7.0,  18, 3, "blue reflection nebula in Cepheus"),
+    ("NGC7129","Cluster + Reflection",   "21h42m00.0s", "+66d06m00s", "reflection",10.0,   8, 4, "compact reflection in Cepheus"),
+    ("NGC1333","Reflection in Perseus",  "03h29m18.0s", "+31d24m00s", "reflection",  9.5,   9, 4, "active star formation, dust clouds"),
+
     # ── GALAXIES ──
     ("M31",    "Andromeda Galaxy",       "00h42m44.3s", "+41d16m09s", "galaxy",     3.4, 190, 1, "too big for one frame, mosaic the core"),
     ("M32",    "Andromeda Satellite",    "00h42m41.8s", "+40d51m55s", "galaxy",     8.1,   8, 2, "compact companion to M31"),
