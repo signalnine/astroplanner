@@ -1680,10 +1680,11 @@ def run_alert(location, start_date, min_alt, min_moon_sep, min_grade="fair"):
     iss_tonight = check_iss_transits_for_nights(start_date, 1)
     iss_events = iss_tonight.get(night_date, [])
     has_iss_transit = any(e["is_transit"] for e in iss_events)
+    has_iss_close = any(e["min_sep"] < 0.5 for e in iss_events)
 
-    # ISS transit always triggers alert regardless of grade
+    # ISS transit or close pass always triggers alert regardless of grade
     grades_ranked = ["poor", "fair", "good", "excellent"]
-    if not has_iss_transit and grades_ranked.index(grade) < grades_ranked.index(min_grade):
+    if not has_iss_transit and not has_iss_close and grades_ranked.index(grade) < grades_ranked.index(min_grade):
         # Below threshold and no ISS transit — stay silent (for cron)
         quiet = not os.environ.get("ASTRO_EMAIL_TO")
         if quiet:
@@ -1701,13 +1702,17 @@ def run_alert(location, start_date, min_alt, min_moon_sep, min_grade="fair"):
     if has_iss_transit:
         subject = (f"Seestar Tonight: ISS LUNAR TRANSIT! "
                    f"({grade}, {moon_illum:.0f}% moon)")
+    elif has_iss_close:
+        closest = min(iss_events, key=lambda e: e["min_sep"])
+        subject = (f"Seestar Tonight: POSSIBLE ISS LUNAR TRANSIT "
+                   f"({closest['min_sep']:.2f}deg, {grade}, {moon_illum:.0f}% moon)")
     else:
         subject = f"Seestar Tonight: {grade.upper()} — {top_name} + {len(results)-1} more"
 
     # Try email, fall back to stdout
     email_sent = send_email(subject, report)
     if email_sent:
-        extra = " + ISS TRANSIT" if has_iss_transit else ""
+        extra = " + ISS TRANSIT" if has_iss_transit else (" + ISS CLOSE PASS" if has_iss_close else "")
         print(f"Alert sent: {grade} night ({', '.join(reasons)}){extra}")
     else:
         # No email config or send failed — print report to stdout
