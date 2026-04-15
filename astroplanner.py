@@ -1196,7 +1196,7 @@ def _observe_target(scope, target, location, dark_end, min_alt, lp_filter_mode,
             from PIL import Image
             img = Image.fromarray(stretched)
             tmp = preview_path + ".tmp"
-            img.save(tmp)
+            img.save(tmp, format="PNG")
             os.replace(tmp, preview_path)
             observe_log(f"Frame {frame_num} saved. Preview updated.")
 
@@ -1257,7 +1257,7 @@ def _update_preview(image_array, preview_path, frame_count, running_sum):
     from PIL import Image
     img = Image.fromarray(stretched)
     tmp = preview_path + ".tmp"
-    img.save(tmp)
+    img.save(tmp, format="PNG")
     os.replace(tmp, preview_path)
     return running_sum
 
