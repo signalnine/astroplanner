@@ -876,16 +876,35 @@ def select_observe_targets(location, start_date, min_alt, min_moon_sep, type_fil
         min_alt, min_moon_sep, type_filter=type_filter,
     )
 
-    # Filter and adjust scores based on remaining observable time
+    # Filter and adjust scores based on remaining observable time + current altitude
     now_time = Time(datetime.now(timezone.utc))
+    altaz_now = AltAz(obstime=now_time, location=location)
     filtered = []
     for r in results:
         effective_start = max(r["window_start"], now_time)
         remaining = (r["window_end"] - effective_start).to(u.hour).value
         if remaining < 1.0:
             continue
+
+        # Current altitude (for preferring targets that are high right now)
+        cat_entry = next((c for c in DSO_CATALOG if c[0] == r["name"]), None)
+        if cat_entry is None:
+            continue
+        coord = SkyCoord(ra=cat_entry[2], dec=cat_entry[3])
+        alt_now = coord.transform_to(altaz_now).alt.deg
+        r["current_alt"] = alt_now
         r["remaining_hours"] = remaining
-        r["adjusted_score"] = r["score"] * min(1.0, remaining / 3.0)
+
+        # Base score penalty for short windows
+        score = r["score"] * min(1.0, remaining / 3.0)
+        # Penalty for targets not currently observable (below min_alt)
+        # Targets above min_alt: full score. Below: scaled down based on how soon they rise.
+        if alt_now < min_alt:
+            minutes_to_window = max(0, (r["window_start"] - now_time).to(u.min).value)
+            # Heavy penalty if more than 30 min away from usable altitude
+            wait_penalty = max(0.1, 1.0 - minutes_to_window / 30.0)
+            score *= wait_penalty
+        r["adjusted_score"] = score
         filtered.append(r)
 
     filtered.sort(key=lambda r: r["adjusted_score"], reverse=True)
@@ -1056,8 +1075,18 @@ def _observe_target(scope, target, location, dark_end, min_alt, lp_filter_mode,
     ra_hours = coord.ra.hour
     dec_deg = coord.dec.deg
 
+    # Pre-slew altitude check: skip targets that aren't high enough yet
+    now_utc = Time(datetime.now(timezone.utc))
+    altaz_frame = AltAz(obstime=now_utc, location=location)
+    current_alt = coord.transform_to(altaz_frame).alt.deg
+    if current_alt < min_alt:
+        observe_log(f"{name} currently at {current_alt:.1f}deg (below {min_alt}deg). Skipping.")
+        session_log.append((name, datetime.now(timezone.utc),
+                            datetime.now(timezone.utc), "too_low", 0))
+        return "target_set"
+
     # Goto
-    observe_log(f"Slewing to {name}...")
+    observe_log(f"Slewing to {name}... (current alt: {current_alt:.1f}deg)")
     start_time = datetime.now(timezone.utc)
 
     goto_success = False
@@ -1113,16 +1142,15 @@ def _observe_target(scope, target, location, dark_end, min_alt, lp_filter_mode,
             return "done"
 
         # Check target altitude (every 10 frames to avoid overhead)
-        if frame_num % 10 == 0 and frame_num > 0:
-            altaz_frame = AltAz(obstime=now_utc, location=location)
-            target_coord = SkyCoord(ra=ra_hours * u.hourangle, dec=dec_deg * u.deg)
-            alt = target_coord.transform_to(altaz_frame).alt.deg
-            if alt < min_alt:
-                observe_log(f"{name} below {min_alt}deg (alt={alt:.1f}deg). "
-                            f"Captured {frame_num} frames")
-                session_log.append((name, start_time, datetime.now(timezone.utc),
-                                    "target_set", frame_num))
-                return "target_set"
+        altaz_frame = AltAz(obstime=now_utc, location=location)
+        target_coord = SkyCoord(ra=ra_hours * u.hourangle, dec=dec_deg * u.deg)
+        alt = target_coord.transform_to(altaz_frame).alt.deg
+        if alt < min_alt:
+            observe_log(f"{name} below {min_alt}deg (alt={alt:.1f}deg). "
+                        f"Captured {frame_num} frames")
+            session_log.append((name, start_time, datetime.now(timezone.utc),
+                                "target_set", frame_num))
+            return "target_set"
 
         # Check disk space periodically (every 100 frames)
         if frame_num > 0 and frame_num % 100 == 0:
@@ -1295,6 +1323,7 @@ def _print_session_summary(session_log):
         total_hours += duration
         total_frames += frames
         status_str = {"complete": "ok", "target_set": "target set",
+                      "too_low": "too low (skipped)",
                       "goto_failed": "goto failed", "exposure_failed": "exposure failed",
                       "download_failed": "download failed", "disk_full": "disk full",
                       "connection_lost": "connection lost",
