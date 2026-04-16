@@ -1256,6 +1256,10 @@ def _save_fits(image_array, output_dir, target_name, frame_num, ra_hours, dec_de
     h["APERTURE"] = 50
     h["SITELAT"] = LATITUDE
     h["SITELONG"] = LONGITUDE
+    # Bayer pattern for raw color sensor data (IMX462 in Seestar S50)
+    h["BAYERPAT"] = "GRBG"
+    h["XBAYROFF"] = 1
+    h["YBAYROFF"] = 0
 
     fname = os.path.join(output_dir, f"{target_name}_{frame_num:04d}.fits")
     # Write to temp file then rename to avoid partial writes
