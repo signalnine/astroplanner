@@ -1260,14 +1260,17 @@ def fetch_night_weather(dark_start_utc, dark_end_utc):
 def _parse_cloud_cover(short_forecast):
     """Estimate cloud cover percentage from NWS short forecast text."""
     s = short_forecast.lower()
-    if "clear" in s or "sunny" in s:
-        return 5
-    if "mostly clear" in s or "mostly sunny" in s:
-        return 15
+    # Check most-specific phrases first: "mostly"/"partly" forecasts contain
+    # the substrings "clear"/"sunny"/"cloudy", so the broader checks would
+    # otherwise shadow them.
     if "partly" in s:
         return 45
+    if "mostly clear" in s or "mostly sunny" in s:
+        return 15
     if "mostly cloudy" in s:
         return 75
+    if "clear" in s or "sunny" in s:
+        return 5
     if "cloudy" in s or "overcast" in s:
         return 90
     if "fog" in s:
