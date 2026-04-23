@@ -441,6 +441,19 @@ def compute_night_batch(targets, catalog, location, dark_start, dark_end,
     return results
 
 
+def _session_midnight_utc(night_date, tz_offset):
+    """
+    Return the astropy Time for midnight local during the evening session that
+    starts on night_date. The session runs from that evening into the next
+    morning, so midnight falls on (night_date + 1) at 00:00 local.
+    """
+    midnight_local = datetime(
+        night_date.year, night_date.month, night_date.day,
+        tzinfo=timezone(timedelta(hours=tz_offset)),
+    ) + timedelta(days=1)
+    return Time(midnight_local.astimezone(timezone.utc))
+
+
 def utc_to_local(t, tz_offset):
     """Convert astropy Time to local datetime string."""
     dt = t.to_datetime(timezone=timezone(timedelta(hours=tz_offset)))
@@ -1532,10 +1545,8 @@ def run_alert(location, start_date, min_alt, min_moon_sep, min_grade="fair"):
 
     dark_hours = (dark_end - dark_start).to(u.hour).value
 
-    # Moon
-    midnight_utc = Time(
-        f"{night_date.strftime('%Y-%m-%d')}T07:00:00", scale="utc"
-    )
+    # Moon (at midnight local DURING the session, i.e. start of next day local)
+    midnight_utc = _session_midnight_utc(night_date, TIMEZONE_OFFSET)
     moon_midnight = get_body("moon", midnight_utc, location)
     sun_midnight = get_sun(midnight_utc)
     elong = moon_midnight.separation(sun_midnight)
@@ -1742,10 +1753,8 @@ def run_week(location, start_date, min_alt, min_moon_sep):
 
         dark_hours = (dark_end - dark_start).to(u.hour).value
 
-        # Moon
-        midnight_utc = Time(
-            f"{night_date.strftime('%Y-%m-%d')}T07:00:00", scale="utc"
-        )
+        # Moon (at midnight local DURING the session, i.e. start of next day local)
+        midnight_utc = _session_midnight_utc(night_date, TIMEZONE_OFFSET)
         moon_mid = get_body("moon", midnight_utc, location)
         sun_mid = get_sun(midnight_utc)
         elong = moon_mid.separation(sun_mid)
@@ -2102,10 +2111,8 @@ def main():
 
         dark_hours = (dark_end - dark_start).to(u.hour).value
 
-        # Moon info at midnight local
-        midnight_utc = Time(
-            f"{night_date.strftime('%Y-%m-%d')}T07:00:00", scale="utc"
-        )  # midnight PDT = 07:00 UTC
+        # Moon info at midnight local (during the session, not start of night_date)
+        midnight_utc = _session_midnight_utc(night_date, TIMEZONE_OFFSET)
         moon_midnight = get_body("moon", midnight_utc, location)
         sun_midnight = get_sun(midnight_utc)
         elong = moon_midnight.separation(sun_midnight)
