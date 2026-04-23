@@ -1623,8 +1623,11 @@ def check_iss_transits_for_nights(start_date, days):
     Returns a dict mapping local date → list of transit result dicts.
     Returns empty dict if skyfield is not installed or TLE fetch fails.
     """
+    # find_iss_lunar_transits scans UTC days, but evening sessions for
+    # negative tz offsets (PDT/PST etc.) run into the following UTC day —
+    # scan one extra day so the last session's morning hours are covered.
     try:
-        results = find_iss_lunar_transits(start_date, days)
+        results = find_iss_lunar_transits(start_date, days + 1)
     except Exception:
         return {}
 
