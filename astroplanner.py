@@ -1647,6 +1647,25 @@ def check_iss_transits_for_nights(start_date, days):
     return by_night
 
 
+def find_iss_transits_for_sessions(start_date, days):
+    """Return a flat, time-ordered list of ISS lunar transit events for the
+    next `days` local evening sessions starting on start_date.
+
+    Unlike find_iss_lunar_transits (which scans UTC days), this respects the
+    configured TIMEZONE_OFFSET so negative-offset observers (PDT/PST etc.)
+    don't miss tonight's session -- that session's transits happen in the
+    following UTC day.
+    """
+    by_night = check_iss_transits_for_nights(start_date, days)
+    end_date = start_date + timedelta(days=days)
+    results = []
+    for session_date in sorted(by_night):
+        if start_date <= session_date < end_date:
+            results.extend(by_night[session_date])
+    results.sort(key=lambda r: r["time"].utc_datetime())
+    return results
+
+
 def fetch_week_weather():
     """
     Fetch the full 7-day hourly forecast from NWS in one call.
@@ -2024,7 +2043,7 @@ def main():
         print("=" * 78)
 
     if args.iss_transits:
-        results = find_iss_lunar_transits(start_date, args.days)
+        results = find_iss_transits_for_sessions(start_date, args.days)
         print_iss_transits(results, start_date, args.days, TIMEZONE_OFFSET)
         return
 

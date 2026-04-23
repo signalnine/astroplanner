@@ -14,7 +14,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import astroplanner
-from astroplanner import check_iss_transits_for_nights
+from astroplanner import check_iss_transits_for_nights, find_iss_transits_for_sessions
 
 
 class _FakeSkyfieldTime:
@@ -102,4 +102,64 @@ def test_pdt_session_transit_found_at_end_of_week():
 
     assert date(2026, 4, 29) in result, (
         f"expected April 29 session key, got {sorted(result.keys())}"
+    )
+
+
+def test_iss_transits_cli_helper_captures_tonights_evening_session():
+    """The --iss-transits CLI path must capture the requested night's session.
+
+    For PDT (-7), a transit at UTC 08:00 April 24 falls in the April 23 PDT
+    evening session. find_iss_transits_for_sessions(April 23, 1) is what the
+    CLI calls; it must include this event. Previously the CLI called
+    find_iss_lunar_transits(start_date, args.days) directly, scanning only
+    UTC [Apr 23, Apr 24) and missing the session entirely.
+    """
+    event_utc = datetime(2026, 4, 24, 8, 0, tzinfo=timezone.utc)
+
+    def fake_find(start_date, days):
+        from datetime import timedelta
+        scan_start = datetime(
+            start_date.year, start_date.month, start_date.day,
+            tzinfo=timezone.utc,
+        )
+        scan_end = scan_start + timedelta(days=days)
+        if scan_start <= event_utc < scan_end:
+            return [_make_event(event_utc)]
+        return []
+
+    with patch.object(astroplanner, "find_iss_lunar_transits", side_effect=fake_find), \
+         patch.object(astroplanner, "TIMEZONE_OFFSET", -7):
+        results = find_iss_transits_for_sessions(date(2026, 4, 23), 1)
+
+    assert len(results) == 1, f"expected 1 event, got {results}"
+    assert results[0]["is_transit"] is True
+
+
+def test_iss_transits_cli_helper_excludes_prior_session_events():
+    """Events belonging to the session before start_date must not leak in.
+
+    For PDT, a transit at UTC 08:00 April 23 falls in the April 22 PDT
+    session. find_iss_transits_for_sessions(April 23, 1) must NOT include it
+    even though the underlying scan window starts at April 23 UTC (and so
+    picks the event up).
+    """
+    event_utc = datetime(2026, 4, 23, 8, 0, tzinfo=timezone.utc)
+
+    def fake_find(start_date, days):
+        from datetime import timedelta
+        scan_start = datetime(
+            start_date.year, start_date.month, start_date.day,
+            tzinfo=timezone.utc,
+        )
+        scan_end = scan_start + timedelta(days=days)
+        if scan_start <= event_utc < scan_end:
+            return [_make_event(event_utc)]
+        return []
+
+    with patch.object(astroplanner, "find_iss_lunar_transits", side_effect=fake_find), \
+         patch.object(astroplanner, "TIMEZONE_OFFSET", -7):
+        results = find_iss_transits_for_sessions(date(2026, 4, 23), 1)
+
+    assert results == [], (
+        f"expected previous-night event to be excluded, got {results}"
     )
