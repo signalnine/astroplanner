@@ -997,7 +997,10 @@ def run_observe(location, start_date, min_alt, min_moon_sep, type_filter,
                     break
             elif result == "error":
                 break
-            target_idx += 1
+            else:
+                raise ValueError(
+                    f"_observe_target returned unexpected result: {result!r}"
+                )
     finally:
         observe_log("Parking telescope...")
         try:
