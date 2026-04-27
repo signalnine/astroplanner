@@ -349,6 +349,18 @@ def find_darkness_window(location, date_utc, tz_offset):
     return dark_start, dark_end
 
 
+def _duration_from_samples(n_above, total_duration, n_samples):
+    """Convert a count of above-threshold samples into a duration.
+
+    Samples are drawn via np.linspace(0, T, N), which puts N points across
+    N-1 equal intervals of width T/(N-1). Returns 0.0 when N<2 (no spacing
+    is defined for a single sample).
+    """
+    if n_samples < 2:
+        return 0.0
+    return n_above * (total_duration / (n_samples - 1))
+
+
 def compute_night_batch(targets, catalog, location, dark_start, dark_end,
                         min_alt, min_moon_sep, type_filter=None):
     """
@@ -414,7 +426,7 @@ def compute_night_batch(targets, catalog, location, dark_start, dark_end,
         peak_idx = np.argmax(alts)
         peak_alt = alts[peak_idx]
         peak_time = times[peak_idx]
-        hours_above = np.sum(above) * (dt_hours / n_samples)
+        hours_above = _duration_from_samples(int(np.sum(above)), dt_hours, n_samples)
 
         above_indices = np.where(above)[0]
         window_start = times[above_indices[0]]
@@ -636,8 +648,8 @@ def find_iss_lunar_transits(start_date, days):
         # Transit duration: time within moon disk
         transit_duration_s = 0.0
         if is_transit:
-            dt_sample = refine_dur / n_fine
-            transit_duration_s = float(np.sum(sep_fine < moon_ang_radius)) * dt_sample
+            n_within = int(np.sum(sep_fine < moon_ang_radius))
+            transit_duration_s = _duration_from_samples(n_within, refine_dur, n_fine)
 
         # Moon illumination
         sun_astrometric = obs_pos.at(mid_t).observe(sun_body)
