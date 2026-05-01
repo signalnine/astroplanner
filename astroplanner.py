@@ -57,6 +57,8 @@ LP_FILTER_AUTO = {
     "emission": True, "SNR": True, "planetary": True,
     "galaxy": False, "globular": False, "open cluster": False,
     "reflection": False, "dark": False,
+    # Stellar point sources (M40, M73): no narrowband emission to isolate.
+    "double star": False, "asterism": False,
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -262,6 +264,8 @@ def score_observation(peak_alt, moon_illum_pct, moon_sep_deg, hours_above_min,
         "emission": 1.0, "dark": 1.0, "reflection": 0.9,
         "SNR": 0.9, "planetary": 0.6, "galaxy": 0.8,
         "globular": 0.3, "open cluster": 0.2,
+        # Stellar point sources tolerate moonlight like clusters do.
+        "double star": 0.2, "asterism": 0.2,
     }
     sensitivity = moon_sensitivity.get(obj_type, 0.7)
     moon_illum_score = 1.0 - (moon_illum_pct / 100) * sensitivity
