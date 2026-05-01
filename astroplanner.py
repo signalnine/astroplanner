@@ -501,7 +501,18 @@ def _angular_sep_deg(alt1, az1, alt2, az2):
 def fetch_iss_tle():
     """Fetch current ISS TLE. Tries Celestrak, then fallback API."""
     import json
+    import urllib.error
     import urllib.request
+
+    # Errors we expect from a flaky network or a malformed TLE response.
+    # Anything else (e.g. programming bugs) should surface, not be swallowed.
+    expected_fetch_errors = (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        UnicodeDecodeError,
+        IndexError,  # response.split('\n') returning < 3 lines
+    )
 
     # Try Celestrak first (canonical source)
     try:
@@ -509,8 +520,11 @@ def fetch_iss_tle():
         response = urllib.request.urlopen(url, timeout=10)
         lines = response.read().decode().strip().split('\n')
         return lines[0].strip(), lines[1].strip(), lines[2].strip()
-    except Exception:
-        pass
+    except expected_fetch_errors as e:
+        # Log so a Celestrak outage / malformed response is visible even when
+        # the fallback succeeds (and so the original cause is preserved when
+        # both sources fail).
+        print(f"  Celestrak ISS TLE fetch failed: {e}; trying fallback...")
 
     # Fallback: TLE API
     try:
@@ -518,8 +532,8 @@ def fetch_iss_tle():
         response = urllib.request.urlopen(url, timeout=10)
         data = json.loads(response.read().decode())
         return data["name"], data["line1"], data["line2"]
-    except Exception as e:
-        print(f"  Error fetching ISS TLE: {e}")
+    except (expected_fetch_errors + (json.JSONDecodeError, KeyError)) as e:
+        print(f"  Error fetching ISS TLE from fallback: {e}")
         return None
 
 
@@ -864,24 +878,37 @@ def select_observe_targets(location, start_date, min_alt, min_moon_sep, type_fil
     # Filter and adjust scores based on remaining observable time + current altitude
     now_time = Time(datetime.now(timezone.utc))
     altaz_now = AltAz(obstime=now_time, location=location)
-    filtered = []
+
+    # First pass: filter by remaining time and collect indices for a batched
+    # transform. Avoids an O(N) catalog scan and a per-object transform_to per
+    # result (was N^2 lookups + N transforms).
+    name_to_idx = {entry[0]: i for i, entry in enumerate(DSO_CATALOG)}
+    surviving = []
+    survivor_indices = []
     for r in results:
         effective_start = max(r["window_start"], now_time)
         remaining = (r["window_end"] - effective_start).to(u.hour).value
         if remaining < 1.0:
             continue
-
-        # Current altitude (for preferring targets that are high right now)
-        cat_entry = next((c for c in DSO_CATALOG if c[0] == r["name"]), None)
-        if cat_entry is None:
+        cat_idx = name_to_idx.get(r["name"])
+        if cat_idx is None:
             continue
-        coord = SkyCoord(ra=cat_entry[2], dec=cat_entry[3])
-        alt_now = coord.transform_to(altaz_now).alt.deg
-        r["current_alt"] = alt_now
         r["remaining_hours"] = remaining
+        surviving.append(r)
+        survivor_indices.append(cat_idx)
 
+    if not surviving:
+        return [], dark_start, dark_end
+
+    # Single batched transform for all surviving targets at "now"
+    survivor_coords = targets[survivor_indices]
+    alts_now = survivor_coords.transform_to(altaz_now).alt.deg
+
+    filtered = []
+    for r, alt_now in zip(surviving, alts_now):
+        r["current_alt"] = float(alt_now)
         # Base score penalty for short windows
-        score = r["score"] * min(1.0, remaining / 3.0)
+        score = r["score"] * min(1.0, r["remaining_hours"] / 3.0)
         # Penalty for targets not currently observable (below min_alt)
         # Targets above min_alt: full score. Below: scaled down based on how soon they rise.
         if alt_now < min_alt:
@@ -1109,10 +1136,10 @@ def _observe_target(scope, target, location, dark_end, min_alt, lp_filter_mode,
             session_log.append((name, start_time, datetime.now(timezone.utc), "complete"))
             return "done"
 
-        # Check target altitude
+        # Check target altitude (reuse SkyCoord parsed before the loop;
+        # J2000 coords don't change across the imaging session)
         altaz_frame = AltAz(obstime=now_utc, location=location)
-        target_coord = SkyCoord(ra=ra_hours * u.hourangle, dec=dec_deg * u.deg)
-        alt = target_coord.transform_to(altaz_frame).alt.deg
+        alt = coord.transform_to(altaz_frame).alt.deg
         if alt < min_alt:
             elapsed = (datetime.now(timezone.utc) - start_time).total_seconds() / 3600
             observe_log(f"{name} below {min_alt}deg (alt={alt:.1f}deg). "
